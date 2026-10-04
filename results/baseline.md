@@ -4,7 +4,7 @@
 
 **Phase 2 is not complete.** The checkout contains one historical full-run log
 for each of IN-R B0I20 and IN-A B0I20, but the required fresh three-seed
-reproduction was not run in this session. The existing results are recorded
+reproduction could not run in this session. The existing results are recorded
 below as historical references only; they are not presented as newly verified
 or as three-seed statistics.
 
@@ -40,6 +40,19 @@ known runtime produced these results.
   weights through `timm` (`utils/inc_net.py:9-54`), so a run without a mounted
   model/cache could attempt an unintended download. No dependencies were
   installed and no data or weights were downloaded.
+
+On 2026-10-04, after the user requested skipping the smoke test and proceeding
+to phase 2, both requested commands were attempted:
+
+```text
+python main.py --config ./exps/adapter_imagenetr.json
+python main.py --config ./exps/adapter_imageneta.json
+```
+
+Both terminated during import with `ModuleNotFoundError: No module named
+'torch'`. The IN-R/IN-A dataset directories and local Torch/Hugging Face model
+caches were also absent. No training started and no new metric was produced.
+The smoke test was not run, as requested.
 
 ## Seed and protocol caveat
 
