@@ -2,6 +2,7 @@ import logging
 import numpy as np
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -24,15 +25,18 @@ class BaseLearner(object):
         self._device = args["device"][0]
         self.data_loader_workers = args["data_loader_workers"]
         self.seed = int(args.get("seed", 1993))
+        self.distributed = bool(args.get("distributed", False))
+        self.rank = int(args.get("rank", 0))
+        self.world_size = int(args.get("world_size", 1))
 
     def _network_module(self):
-        if isinstance(self._network, nn.DataParallel):
+        if isinstance(self._network, (nn.DataParallel, DistributedDataParallel)):
             return self._network.module
         return self._network
 
     @property
     def feature_dim(self):
-        if isinstance(self._network, nn.DataParallel):
+        if isinstance(self._network, (nn.DataParallel, DistributedDataParallel)):
             return self._network.module.feature_dim
         else:
             return self._network.feature_dim

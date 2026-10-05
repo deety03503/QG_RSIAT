@@ -21,7 +21,12 @@ def parse_arguments():
         help="JSON file of settings.",
     )
     parser.add_argument("--seed", type=int, nargs="+", default=None)
-    parser.add_argument("--num_worker", type=int, default=None)
+    parser.add_argument(
+        "--num_worker",
+        type=int,
+        default=None,
+        help="Number of GPUs/DDP processes; launch multi-GPU runs with torchrun.",
+    )
     parser.add_argument("--data_loader_workers", type=int, default=None)
     parser.add_argument(
         "--use_amp",

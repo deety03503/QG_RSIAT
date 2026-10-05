@@ -5,8 +5,9 @@ def _apply_ry(state, angles, qubit):
     shape = (*state.shape[:-1], *([2] * (angles.shape[-1])))
     amplitudes = state.reshape(shape).movedim(qubit + 1, -1)
     angle = angles[..., qubit]
-    cosine = torch.cos(angle / 2).unsqueeze(-1)
-    sine = torch.sin(angle / 2).unsqueeze(-1)
+    broadcast_shape = (angle.shape[0],) + (1,) * (amplitudes.ndim - 2)
+    cosine = torch.cos(angle / 2).reshape(broadcast_shape)
+    sine = torch.sin(angle / 2).reshape(broadcast_shape)
     zero, one = amplitudes.unbind(dim=-1)
     rotated = torch.stack(
         (cosine * zero - sine * one, sine * zero + cosine * one), dim=-1
@@ -43,6 +44,7 @@ def statevector(angles):
     _, layers, n_qubits = angles.shape
     if layers < 1 or n_qubits < 1:
         raise ValueError("layers and qubits must both be positive")
+    angles = angles.to(dtype=torch.float32)
     state = angles.new_zeros((angles.shape[0], 1 << n_qubits))
     state[:, 0] = 1
     for layer in range(layers):
@@ -60,6 +62,8 @@ def fidelity(state_a, state_b):
         raise ValueError("statevectors must be rank-2 tensors")
     if state_a.shape[1] != state_b.shape[1]:
         raise ValueError("statevectors must have matching state dimensions")
+    state_a = state_a.to(dtype=torch.float32)
+    state_b = state_b.to(dtype=torch.float32)
     overlaps = state_a @ state_b.transpose(0, 1)
     return overlaps.square().clamp(0.0, 1.0)
 
