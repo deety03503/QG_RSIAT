@@ -50,8 +50,12 @@ class iCIFAR224(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100("./data/datasets", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100("./data/datasets", train=False, download=True)
+        train_dataset = datasets.cifar.CIFAR100(
+            "./data/datasets", train=True, download=False
+        )
+        test_dataset = datasets.cifar.CIFAR100(
+            "./data/datasets", train=False, download=False
+        )
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
