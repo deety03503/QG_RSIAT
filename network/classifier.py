@@ -1,3 +1,4 @@
+import torch
 from torch import nn
 from torch.nn import functional as F
 from timm.models.layers.weight_init import trunc_normal_
@@ -53,4 +54,3 @@ class SimpleContinualLinear(nn.Module):
             out.append(1*(F.linear(F.normalize(fc_inp, p=2, dim=1),F.normalize(self.heads[ti][0].weight, p=2, dim=1))))
         out = {'logits': torch.cat(out, dim=1)}
         return out
-
