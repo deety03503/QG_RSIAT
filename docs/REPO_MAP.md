@@ -94,4 +94,11 @@ Các quyết định sau do người dùng xác nhận sau khi hoàn tất G1. �
 
 ## Ranh giới G1
 
-G1 chỉ tạo bản đồ tĩnh này. Không chạy mô hình, không tái lập baseline, không viết test, và không chỉnh sửa mã/config gốc. Các quyết định ở trên được ghi nhận cho G2–G8; chúng chưa được triển khai hoặc kiểm chứng runtime.
+G1 chỉ tạo bản đồ tĩnh; không chạy mô hình, không tái lập baseline, không viết test và không chỉnh sửa mã/config gốc.
+
+## Trạng thái G2
+
+- Đã tạo nền tảng package `qrsiat/`: schema/merge cấu hình, phát hiện phần cứng và lập runtime plan, callback OOM probe, runtime context/precision/optimization fallback, logging/seed/timing/atomic JSON/report.
+- Cấu hình mới mặc định seed `1993`; tương thích với `seed` dạng list trong các JSON RSIAT gốc và giữ nguyên các key legacy.
+- Tính năng tối ưu rủi ro (compile, frozen cast, gradient checkpointing, OOM probe) không tự chạy nếu không được gọi/bật. G2 không thay đổi `main.py`, trainer hoặc learner.
+- Chỉ kiểm tra tĩnh cú pháp và diagnostics; không chạy test, mô hình hoặc probe, cũng không xác nhận GPU/Kaggle runtime. Tích hợp vào luồng chạy RSIAT còn thuộc các giai đoạn sau.
