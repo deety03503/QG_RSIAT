@@ -21,8 +21,8 @@ def parse_arguments():
         help="JSON file of settings.",
     )
     parser.add_argument("--seed", type=int, nargs="+", default=None)
-    parser.add_argument("--device", nargs="+", default=None)
     parser.add_argument("--num_worker", type=int, default=None)
+    parser.add_argument("--data_loader_workers", type=int, default=None)
     parser.add_argument("--aligner", choices=("rae", "qhybrid"), default=None)
     parser.add_argument("--lambda_qrel", type=float, default=None)
     parser.add_argument(
@@ -67,7 +67,8 @@ def merge_configs(args, config):
 
     defaults = {
         "class_order_seed": 1993,
-        "num_worker": 8,
+        "num_worker": 2,
+        "data_loader_workers": 8,
         "aligner": "rae",
         "lambda_qrel": 0.0,
         "kernel": "quantum",

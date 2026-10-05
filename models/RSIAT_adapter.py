@@ -109,11 +109,11 @@ class Learner(BaseLearner):
             train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=self.num_worker,
+            num_workers=self.data_loader_workers,
             worker_init_fn=seed_worker,
             generator=train_generator,
             pin_memory=self._device.type == "cuda",
-            persistent_workers=self.num_worker > 0,
+            persistent_workers=self.data_loader_workers > 0,
         )
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         test_generator = torch.Generator()
@@ -122,15 +122,15 @@ class Learner(BaseLearner):
             test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_worker,
+            num_workers=self.data_loader_workers,
             worker_init_fn=seed_worker,
             generator=test_generator,
             pin_memory=self._device.type == "cuda",
-            persistent_workers=self.num_worker > 0,
+            persistent_workers=self.data_loader_workers > 0,
         )
 
-        if len(self._multiple_gpus) > 1:
-            device_ids = [device.index for device in self._multiple_gpus]
+        if self.num_worker > 1:
+            device_ids = list(range(self.num_worker))
             self._network = nn.DataParallel(
                 self._network, device_ids=device_ids, output_device=device_ids[0]
             )
@@ -140,10 +140,14 @@ class Learner(BaseLearner):
                 device_ids,
                 device_ids[0],
             )
-        else:
+        elif self._device.type == "cuda":
             logging.info(
                 "Using single-GPU training on %s; torch.nn.DataParallel is disabled",
-                self._multiple_gpus[0],
+                self._device,
+            )
+        else:
+            logging.info(
+                "Using CPU training; torch.nn.DataParallel is disabled"
             )
 
       

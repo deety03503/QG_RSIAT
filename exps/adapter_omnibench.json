@@ -8,10 +8,10 @@
     "increment": 30,
     "model_name": "adapter",
     "convnet_type": "pretrained_vit_b16_224_in21k_adapter",
-    "device": ["0"],
+    "num_worker": 1,
     "seed": [1993],
     "class_order_seed": 1993,
-    "num_worker": 8,
+    "data_loader_workers": 8,
 
     "aligner": "rae",
     "lambda_qrel": 0.0,

@@ -19,9 +19,9 @@ class BaseLearner(object):
         self._network = None
         self._old_network = None
         self.topk = 5
-        self._multiple_gpus = args["device"]
-        self._device = self._multiple_gpus[0]
-        self.num_worker = args.get("num_worker", 8)
+        self.num_worker = args["num_worker"]
+        self._device = args["device"][0]
+        self.data_loader_workers = args["data_loader_workers"]
         self.seed = int(args.get("seed", 1993))
 
     def _network_module(self):
@@ -230,7 +230,7 @@ class BaseLearner(object):
                 idx_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=self.num_worker,
+                num_workers=self.data_loader_workers,
                 worker_init_fn=seed_worker,
                 generator=generator,
             )
