@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
-from utils.toolkit import log_count_parameter, tensor2numpy, seed_worker
+from utils.toolkit import log_count_parameter, seed_worker
 from utils.loss import AngularPenaltySMLoss
 from utils.toolkit import AutoencoderSigmoid
 from quantum import QHybridAligner, QuantumFeatureMap, kernel_matrix, qorth_loss, qrel_loss
@@ -241,24 +241,21 @@ class Learner(BaseLearner):
             self._init_train(train_loader, test_loader, optimizer, scheduler, self.args['warmup_epoch'])
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler, warmup_epoch):
-        prog_bar = tqdm(range(self.tuned_epochs))
+        prog_bar = tqdm(
+            range(self.tuned_epochs),
+            desc=f"Task {self._cur_task + 1}",
+            unit="epoch",
+        )
         
         for _, epoch in enumerate(prog_bar):
             self._network.train()
             losses = 0.0
             losses_c, losses_rt = 0.0, 0.0
-            correct, total = 0, 0
 
-            batch_bar = tqdm(
-                train_loader,
-                desc=f"Task {self._cur_task + 1} | Epoch {epoch + 1}/{self.tuned_epochs}",
-                unit="batch",
-                leave=False,
-            )
-            for i, (_, inputs, targets) in enumerate(batch_bar):
+            for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self._device, non_blocking=True)
                 targets = targets.to(self._device, non_blocking=True)
-                logits, loss_c, loss_rt = self._compute_rt_loss(inputs, targets, epoch, warmup_epoch)
+                _, loss_c, loss_rt = self._compute_rt_loss(inputs, targets, epoch, warmup_epoch)
                 loss = loss_c + loss_rt
                 optimizer.zero_grad()
                 loss.backward()
@@ -266,25 +263,21 @@ class Learner(BaseLearner):
                 losses += loss.item()
                 losses_c += loss_c.item()
                 losses_rt += loss_rt.item()
-                _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
-                batch_bar.set_postfix(
+                prog_bar.set_postfix(
+                    batch=f"{i + 1}/{len(train_loader)}",
                     loss=f"{losses / (i + 1):.3f}",
-                    train_acc=f"{100 * correct.item() / total:.2f}%",
+                    refresh=False,
                 )
             scheduler.step()
 
-            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Test_accy {:.2f}".format(
                 self._cur_task,
                 epoch + 1,
                 self.tuned_epochs,
                 losses / len(train_loader),
                 losses_c/len(train_loader),
                 losses_rt/len(train_loader),
-                train_acc,
                 test_acc,
             )
             prog_bar.set_description(info)
