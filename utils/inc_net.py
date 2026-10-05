@@ -2,7 +2,7 @@ import copy
 import logging
 import torch
 from torch import nn
-from network.classifier import  CosineLinear, SimpleContinualLinear
+from network.classifier import SimpleContinualLinear
 import timm
 
 
@@ -175,31 +175,15 @@ class SimpleVitNet(BaseNet):
     def extract_vector(self, x):
         return self.convnet(x)
 
-    def forward(self, x, bcb_no_grad=False, fc_only=False):
-        x = self.convnet(x)
-        out = self.fc(x)
-        # out.update(x)
+    def forward(self, x, bcb_no_grad=False, fc_only=False, return_features=False):
+        features = self.convnet(x)
+        out = self.fc(features)
+        if return_features:
+            out["features"] = features
         return out
 
     def ca_forward(self, x):
         fc_out = self.fc(x)
         return fc_out
-
-    def weight_align(self, increment):
-        oldweights = None
-        for i in range(increment):
-            if oldweights is None:
-                oldweights = self.fc.heads[i][0].weight.data
-            else:
-                oldweights = torch.cat((oldweights, self.fc.heads[i][0].weight.data))
-        newweights = self.fc.heads[increment][0].weight.data
-        newnorm = torch.norm(newweights, p=2, dim=1)
-        oldnorm = torch.norm(oldweights, p=2, dim=1)
-
-        meannew = torch.mean(newnorm)
-        meanold = torch.mean(oldnorm)
-        gamma = meanold / meannew
-        print("alignweights,gamma=", gamma)
-        self.fc.heads[increment][0].weight.data[-increment:, :] *= gamma
 
 

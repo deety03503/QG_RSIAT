@@ -8,8 +8,23 @@
     "increment": 10,
     "model_name": "adapter",
     "convnet_type": "pretrained_vit_b16_224_in21k_adapter",
-    "device": ["0"],
+    "num_worker": 1,
     "seed": [1993],
+    "class_order_seed": 1993,
+    "data_loader_workers": 8,
+
+    "aligner": "rae",
+    "lambda_qrel": 0.0,
+    "kernel": "quantum",
+    "orth": "plain",
+    "rs_kernel": "cosine",
+    "qbits": 8,
+    "q_layers": 2,
+    "orth_topk": 5,
+    "orth_tau": 0.1,
+    "orth_epsilon": 0.5,
+    "orth_use_drift_comp": true,
+    "center_features": true,
     
     "init_epochs":30,
     "warmup_epoch":3,
@@ -33,4 +48,3 @@
     "ae_init_lr":5.0175731532879885e-05,
     "ae_weight_decay":0.043872546114818035
 }
-

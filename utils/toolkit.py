@@ -1,8 +1,8 @@
-import os
 import numpy as np
 import torch
 import torch.nn as nn
 import logging
+import random
 
 def count_parameters(model, trainable=False):
     if trainable:
@@ -24,15 +24,10 @@ def tensor2numpy(x):
     return x.cpu().data.numpy() if x.is_cuda else x.data.numpy()
 
 
-def target2onehot(targets, n_classes):
-    onehot = torch.zeros(targets.shape[0], n_classes).to(targets.device)
-    onehot.scatter_(dim=1, index=targets.long().view(-1, 1), value=1.0)
-    return onehot
-
-
-def makedirs(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def accuracy(y_pred, y_true, nb_old, increment=10):

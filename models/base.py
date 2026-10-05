@@ -1,4 +1,3 @@
-import copy
 import logging
 import numpy as np
 import torch
@@ -7,10 +6,8 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.distributions.multivariate_normal import MultivariateNormal
-from utils.toolkit import tensor2numpy, accuracy
-from scipy.spatial.distance import cdist
-import time
-EPSILON = 1e-8
+from utils.toolkit import tensor2numpy, accuracy, seed_worker
+
 batch_size = 64
 
 
@@ -21,25 +18,16 @@ class BaseLearner(object):
         self._total_classes = 0
         self._network = None
         self._old_network = None
-        self._data_memory, self._targets_memory = np.array([]), np.array([])
         self.topk = 5
+        self.num_worker = args["num_worker"]
         self._device = args["device"][0]
-        self._multiple_gpus = args["device"]
+        self.data_loader_workers = args["data_loader_workers"]
+        self.seed = int(args.get("seed", 1993))
 
-    @property
-    def exemplar_size(self):
-        assert len(self._data_memory) == len(
-            self._targets_memory
-        ), "Exemplar size error."
-        return len(self._targets_memory)
-
-    @property
-    def samples_per_class(self):
-        if self._fixed_memory:
-            return self._memory_per_class
-        else:
-            assert self._total_classes != 0, "Total classes is 0"
-            return self._memory_size // self._total_classes
+    def _network_module(self):
+        if isinstance(self._network, nn.DataParallel):
+            return self._network.module
+        return self._network
 
     @property
     def feature_dim(self):
@@ -50,12 +38,13 @@ class BaseLearner(object):
 
 
     def _stage2_compact_classifier(self, task_size, ca_epochs=5):
-        for p in self._network.fc.parameters():
+        network = self._network_module()
+        for p in network.fc.parameters():
             p.requires_grad = True
 
         run_epochs = ca_epochs
         crct_num = self._total_classes
-        param_list = [p for p in self._network.fc.parameters() if p.requires_grad]
+        param_list = [p for p in network.fc.parameters() if p.requires_grad]
         network_params = [{'params': param_list, 'lr': self.init_lr,
                            'weight_decay': self.weight_decay}]
 
@@ -63,9 +52,6 @@ class BaseLearner(object):
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=run_epochs)
 
         self._network.to(self._device)
-
-        if len(self._multiple_gpus) > 1:
-            self._network = nn.DataParallel(self._network, self._multiple_gpus)
 
         self._network.eval()
 
@@ -100,7 +86,7 @@ class BaseLearner(object):
                 tgt = targets[_iter * num_sampled_pcls:(_iter + 1) * num_sampled_pcls]
 
                 # -stage two only use classifiers
-                outputs = self._network.ca_forward(inp)
+                outputs = network.ca_forward(inp)
                 logits = self.args['scale'] * outputs['logits']
 
                 if self.logit_norm is not None:
@@ -168,24 +154,26 @@ class BaseLearner(object):
     def _train(self):
         pass
 
-    def _get_memory(self):
-        if len(self._data_memory) == 0:
-            return None
-        else:
-            return (self._data_memory, self._targets_memory)
-
     def _compute_accuracy(self, model, loader):
         model.eval()
-        correct, total = 0, 0
-        for i, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.to(self._device)
-            with torch.no_grad():
+        correct = torch.zeros((), device=self._device)
+        total = 0
+        use_amp = bool(getattr(self, "use_amp", False))
+        amp_dtype = getattr(self, "amp_dtype", torch.float16)
+        for _, inputs, targets in loader:
+            inputs = inputs.to(self._device, non_blocking=True)
+            targets = targets.to(self._device, non_blocking=True)
+            with torch.inference_mode(), torch.autocast(
+                device_type=self._device.type,
+                dtype=amp_dtype,
+                enabled=use_amp,
+            ):
                 outputs = model(inputs)["logits"]
             predicts = torch.max(outputs, dim=1)[1]
-            correct += (predicts.cpu() == targets).sum()
-            total += len(targets)
+            correct += (predicts == targets).sum()
+            total += targets.numel()
 
-        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+        return np.around(correct.item() * 100 / total, decimals=2)
 
     def _eval_cnn(self, loader):
         self._network.eval()
@@ -210,14 +198,11 @@ class BaseLearner(object):
         vectors, targets = [], []
         for _, _inputs, _targets in loader:
             _targets = _targets.numpy()
-            if isinstance(self._network, nn.DataParallel):
-                _vectors = tensor2numpy(
-                    self._network.module.extract_vector(_inputs.to(self._device))
+            with torch.no_grad():
+                outputs = self._network(
+                    _inputs.to(self._device), return_features=True
                 )
-            else:
-                _vectors = tensor2numpy(
-                    self._network.extract_vector(_inputs.to(self._device))
-                )
+            _vectors = tensor2numpy(outputs["features"])
 
             vectors.append(_vectors)
             targets.append(_targets)
@@ -231,11 +216,15 @@ class BaseLearner(object):
             new_class_means = np.zeros((self._total_classes, self.feature_dim))
             new_class_means[:self._known_classes] = self._class_means
             self._class_means = new_class_means
+            new_raw_means = np.zeros((self._total_classes, self.feature_dim))
+            new_raw_means[:self._known_classes] = self._class_means_raw
+            self._class_means_raw = new_raw_means
             new_class_cov = torch.zeros((self._total_classes, self.feature_dim, self.feature_dim))
             new_class_cov[:self._known_classes] = self._class_covs
             self._class_covs = new_class_cov
         elif not check_diff:
             self._class_means = np.zeros((self._total_classes, self.feature_dim))
+            self._class_means_raw = np.zeros((self._total_classes, self.feature_dim))
             self._class_covs = torch.zeros((self._total_classes, self.feature_dim, self.feature_dim))
 
         radius = []
@@ -243,7 +232,16 @@ class BaseLearner(object):
 
             data, targets, idx_dataset = data_manager.get_dataset(np.arange(class_idx, class_idx + 1), source='train',
                                                                   mode='test', ret_data=True)
-            idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + class_idx)
+            idx_loader = DataLoader(
+                idx_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=self.data_loader_workers,
+                worker_init_fn=seed_worker,
+                generator=generator,
+            )
             vectors, _ = self._extract_vectors(idx_loader)
             class_mean = np.mean(vectors, axis=0)
             if self._cur_task == 0:
@@ -252,36 +250,12 @@ class BaseLearner(object):
             class_cov = torch.cov(torch.tensor(vectors, dtype=torch.float64).T) + torch.eye(class_mean.shape[-1]) * 1e-3
 
             self._class_means[class_idx, :] = class_mean
+            self._class_means_raw[class_idx, :] = class_mean
             self._class_covs[class_idx, ...] = class_cov
 
         if self._cur_task == 0:
                 self.radius = np.sqrt(np.mean(radius))
                 print(self.radius)
-
-    def displacement_cov(self, Y, class_mean, embedding_old, sigma):
-        cov = None
-        start_time = time.time()
-        for _class in range(self._known_classes):
-            loop_start_time = time.time()
-            DY = self.cov_computation(Y, class_mean[_class])
-            distance = np.sum((np.tile(Y[None, :, :], [1, 1, 1]) - np.tile(
-                embedding_old[_class, None, :], [1, Y.shape[0], 1])) ** 2, axis=2)
-            W = np.exp(-distance / (2 * sigma ** 2)) + 1e-5
-            W_norm = W / np.tile(np.sum(W, axis=1)[:, None], [1, W.shape[1]])
-            if cov is None:
-                cov = np.sum(np.tile(W_norm[:, :, None, None], [
-                    1, 1, DY.shape[1], DY.shape[2]]) * np.tile(DY[None, :, :, :], [W.shape[0], 1, 1, 1]), axis=1)
-            else:
-                displacement = np.sum(np.tile(W_norm[:, :, None, None], [
-                    1, 1, DY.shape[1], DY.shape[2]]) * np.tile(DY[None, :, :, :], [W.shape[0], 1, 1, 1]), axis=1)
-                cov = np.concatenate((cov, displacement))
-            loop_end_time = time.time()
-            print("single loop time: ", loop_end_time - loop_start_time)
-        end_time = time.time()
-        print("total loop time: ", end_time - start_time)
-
-        cov = torch.tensor(cov)
-        return cov
 
     def displacement(self, Y1, Y2, embedding_old, sigma):
         DY = Y2 - Y1
