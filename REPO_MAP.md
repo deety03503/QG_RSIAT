@@ -64,45 +64,26 @@ are file paths and line numbers from base commit
   NumPy and shuffle class order when `shuffle` is true. This violates the
   outline's separation between training seeds and the fixed class-order seed
   1993.
-- GPU setup is in `trainer.py:95-106`. It iterates over configured devices and
-  constructs `cuda:<id>` devices. Its `device_type == -1` check compares the
-  whole configured value to an integer while iterating, so the apparent CPU
-  branch is unreachable for the JSON list format. The configs specify device
-  IDs as strings (for example `["0"]`).
-- Three explicit `DataLoader` creation sites exist: train and test loaders at
-  `models/RSIAT_adapter.py:87-89` use hard-coded `num_workers=8`; class-mean
-  extraction at `models/base.py:246` uses hard-coded `num_workers=4`. The
-  module-level `num_workers = 8` at `models/RSIAT_adapter.py:18` is not used.
-  Feature extraction and classifier calibration consume existing loaders or
-  synthetic tensors; they do not create additional loaders.
+- GPU setup is in `trainer.py:_set_device`. `num_worker` is the requested GPU
+  count: `0` selects CPU, `1` selects `cuda:0`, and larger values select the
+  first N visible GPUs. A request larger than the visible GPU count fails
+  explicitly. GPU devices are stored internally as `torch.device` values.
+- Train, test, and class-mean `DataLoader`s use the separate
+  `data_loader_workers` setting (default `8`), not the GPU-count setting.
 - Input batch size is dataset-configured (`batch_size` key in each
   `exps/adapter_*.json`) and is used for train/test loaders in
   `models/RSIAT_adapter.py:26,87-89`. Calibration creates a synthetic batch
   of 256 samples per class (`models/base.py:72-93`).
-- The learner wraps `_network` in `nn.DataParallel` at
-  `models/RSIAT_adapter.py:91-94`, but sets `_network_module_ptr` to the
-  original network before wrapping (`:79-80`). Training loss calls
-  `_network_module_ptr.extract_vector` and `.fc` directly
-  (`:214-215`), bypassing the wrapper. In addition, `_train` accesses
-  `.convnet`/`.fc` on the wrapped object (`:127-159`); custom members of a
-  `DataParallel` wrapper are on `.module`, so this path can fail. The
-  `extract_features` helper invokes `.extract_vector()` directly on its model
-  argument and `.cuda()` without selecting the learner's device (`:50-64`);
-  on a `DataParallel` model the custom method is not exposed by the wrapper.
-  Classifier calibration later wraps `_network` and calls `.ca_forward()`
-  directly (`models/base.py:52-142`), another custom method not routed through
-  `forward`. Thus existing code does not establish working,
-  gradient-synchronized multi-GPU training.
-- Inference via the wrapped model's `forward` is distinct from direct
-  `.extract_vector()` calls. `models/base.py:208-225` handles `DataParallel`
-  by explicitly selecting `.module` for vector extraction, but this does not
-  repair the learner's direct training calls.
+- Multi-GPU training wraps the current network and frozen old network in
+  `nn.DataParallel`, splitting each forward pass across all visible GPUs.
+  Classifier calibration wraps its classifier in `nn.DataParallel` while
+  operating on synthetic feature batches.
 
 ## Configuration and dependencies
 
 - `args.sh:1-6` launches one process per dataset, each specifying a JSON file.
-- JSON configs contain per-dataset training settings and `seed: [1993]`;
-  none contains the proposed QR-RSIAT flags or `num_worker`.
+- JSON configs contain per-dataset training settings, `seed: [1993]`, and
+  `num_worker: 2`; launch each configured run with `python main.py`.
 - `requirements.txt` pins `torch==2.8.0+cu126` and
   `torchvision==0.23.0+cu126`, while the modified `README.md` still describes
   Python 3.10 and CUDA 11.8. This mismatch is a compatibility risk; no package
@@ -111,10 +92,10 @@ are file paths and line numbers from base commit
 - Image-folder dataset locations are hard-coded under `./data/datasets/` in
   `data/data.py`; the repository does not contain those datasets or Kaggle
   runtime mounts. This differs from the outline's generic `datasets/` layout.
-- `utils/inc_net.py:9-54` creates a timm ViT with `pretrained=True`; there is
-  no project config key or loader argument for a user-specified mounted
-  checkpoint path. The stated Kaggle weight input must be checked against
-  timm's cache/load behavior before any run to avoid an unintended download.
+- `Vit.py` downloads the `google/vit-base-patch16-224-in21k` checkpoint from
+  Hugging Face. `utils/inc_net.py:9-54` creates the timm architecture with
+  `pretrained=False` and loads weights from that local Hugging Face snapshot;
+  it does not request pretrained weights from timm.
 - Local checks on 2026-10-04: CPython 3.14.5 compiled 16 repository Python
   files in memory without syntax errors and parsed all six experiment JSON
   files. The selected `.venv` is Python 3.14.5 and has no installed `torch`;
@@ -211,7 +192,7 @@ all callers. Leave pre-existing user changes untouched.
 
   ```bash
   python main.py --config ./exps/adapter_imagenetr.json --seed 1993 \
-    --device 0 --num_worker 8 --aligner qhybrid --lambda_qrel 1.0 \
+    --num_worker 1 --data_loader_workers 8 --aligner qhybrid --lambda_qrel 1.0 \
     --kernel quantum --orth qweighted
   ```
 
@@ -220,11 +201,9 @@ all callers. Leave pre-existing user changes untouched.
 - Training RNG now follows the selected `seed`; class order is generated
   independently from `class_order_seed=1993`. Loader worker count and seeded
   generators are passed to train, test and class-mean DataLoaders.
-- Current-model training forward now goes through `DataParallel` and gathers
-  features/logits before loss computation. Classifier calibration and
-  feature-extraction custom methods are intentionally run through the
-  unwrapped module where appropriate. GPU IDs are validated and per-GPU model
-  and VRAM are logged.
+- Multi-GPU training uses `nn.DataParallel`; the current network, frozen old
+  network, and calibration classifier forward passes are distributed across
+  the visible GPUs.
 - Removed the dead-code candidates listed above, including the orphaned
   `utils/ops.py`; baseline classifier, task evaluation, data loading, drift,
   and Gaussian calibration code remain.

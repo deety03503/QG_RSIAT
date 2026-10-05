@@ -37,7 +37,13 @@ RSIAT/
 
 The training and evaluation instructions for each dataset are in the "./args.sh" file. Each dataset can be calculated separately, and the results are stored in the "./logs" folder.
 
-To train with multiple GPUs, set the `device` list in the experiment JSON to the CUDA device IDs to use (for example, `"device": ["0", "1"]`), or pass them with `--device 0 1`. The model uses `torch.nn.DataParallel` across the listed GPUs; use a single ID for single-GPU training or `"cpu"` for CPU training.
+Multi-GPU training runs in one process with `torch.nn.DataParallel`, which splits batches across all visible GPUs when at least two are available. The current model, frozen old model, and classifier calibration are all wrapped for multi-GPU forward passes. Set `num_worker` to `0` to force CPU; otherwise the requested count must not exceed the visible GPU count. You can set this in an experiment JSON or override it on the command line.
+
+`data_loader_workers` separately controls the number of CPU workers used by each `DataLoader` (default: `8`); use `--data_loader_workers 0` to load data in the main process.
+
+CUDA training uses automatic mixed precision by default (`--no-use_amp` disables it). The trainer selects bfloat16 when the GPU supports it and otherwise uses float16; AMP is disabled for quantum-simulator runs to retain their numeric stability. Validation runs after each task finishes, not after every epoch; task-wise accuracy is reported for all tasks seen so far.
+
+For example, on one CUDA GPU, run `python main.py --config ./exps/adapter_imageneta.json --num_worker 1 --data_loader_workers 4`. For two GPUs, run `python main.py --config ./exps/adapter_imageneta.json --num_worker 2 --data_loader_workers 4`. Tune `data_loader_workers` to the CPU and storage speed, and tune `batch_size` to fit available GPU memory.
 
 ## Citation
 
