@@ -259,9 +259,12 @@ class Learner(BaseLearner):
             range(self.tuned_epochs),
             desc=f"Task {self._cur_task + 1}",
             unit="epoch",
+            dynamic_ncols=True,
+            leave=True,
         )
-        
-        for _, epoch in enumerate(prog_bar):
+
+        info = None
+        for epoch in prog_bar:
             self._network.train()
             losses = 0.0
             losses_c, losses_rt = 0.0, 0.0
@@ -277,25 +280,36 @@ class Learner(BaseLearner):
                 losses += loss.item()
                 losses_c += loss_c.item()
                 losses_rt += loss_rt.item()
+                avg_loss = losses / (i + 1)
                 prog_bar.set_postfix(
-                    batch=f"{i + 1}/{len(train_loader)}",
-                    loss=f"{losses / (i + 1):.3f}",
+                    loss=f"{avg_loss:.3f}",
                     refresh=False,
                 )
             scheduler.step()
 
             test_acc = self._compute_accuracy(self._network, test_loader)
+            avg_loss = losses / len(train_loader) if len(train_loader) else 0.0
+            avg_loss_c = losses_c / len(train_loader) if len(train_loader) else 0.0
+            avg_loss_rt = losses_rt / len(train_loader) if len(train_loader) else 0.0
             info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Test_accy {:.2f}".format(
-                self._cur_task,
+                self._cur_task + 1,
                 epoch + 1,
                 self.tuned_epochs,
-                losses / len(train_loader),
-                losses_c/len(train_loader),
-                losses_rt/len(train_loader),
+                avg_loss,
+                avg_loss_c,
+                avg_loss_rt,
                 test_acc,
             )
-            prog_bar.set_description(info)
-        logging.info(info)
+            prog_bar.set_description(f"Task {self._cur_task + 1} Epoch {epoch + 1}/{self.tuned_epochs}")
+            prog_bar.set_postfix(
+                loss=f"{avg_loss:.3f}",
+                loss_c=f"{avg_loss_c:.3f}",
+                loss_rt=f"{avg_loss_rt:.3f}",
+                acc=f"{test_acc:.2f}",
+                refresh=True,
+            )
+        if info is not None:
+            logging.info(info)
 
     def _alignment_module(self):
         return self.quantum_aligner if self.quantum_aligner is not None else self.old_ae
