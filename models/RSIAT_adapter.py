@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import torch
 from torch import nn
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -72,7 +72,7 @@ class Learner(BaseLearner):
         with torch.no_grad():
             for batch in trainloader:
                 (_, data, label) = batch
-                data = data.to(self._device)
+                data = data.to(self._device, non_blocking=True)
                 outputs = model(data, return_features=True)
                 embedding = outputs["features"]
                 embedding_list.append(embedding.cpu())
@@ -112,6 +112,8 @@ class Learner(BaseLearner):
             num_workers=self.num_worker,
             worker_init_fn=seed_worker,
             generator=train_generator,
+            pin_memory=self._device.type == "cuda",
+            persistent_workers=self.num_worker > 0,
         )
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         test_generator = torch.Generator()
@@ -123,6 +125,8 @@ class Learner(BaseLearner):
             num_workers=self.num_worker,
             worker_init_fn=seed_worker,
             generator=test_generator,
+            pin_memory=self._device.type == "cuda",
+            persistent_workers=self.num_worker > 0,
         )
 
         if len(self._multiple_gpus) > 1:
@@ -245,8 +249,15 @@ class Learner(BaseLearner):
             losses_c, losses_rt = 0.0, 0.0
             correct, total = 0, 0
 
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self._device), targets.to(self._device)
+            batch_bar = tqdm(
+                train_loader,
+                desc=f"Task {self._cur_task + 1} | Epoch {epoch + 1}/{self.tuned_epochs}",
+                unit="batch",
+                leave=False,
+            )
+            for i, (_, inputs, targets) in enumerate(batch_bar):
+                inputs = inputs.to(self._device, non_blocking=True)
+                targets = targets.to(self._device, non_blocking=True)
                 logits, loss_c, loss_rt = self._compute_rt_loss(inputs, targets, epoch, warmup_epoch)
                 loss = loss_c + loss_rt
                 optimizer.zero_grad()
@@ -258,6 +269,10 @@ class Learner(BaseLearner):
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
+                batch_bar.set_postfix(
+                    loss=f"{losses / (i + 1):.3f}",
+                    train_acc=f"{100 * correct.item() / total:.2f}%",
+                )
             scheduler.step()
 
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)

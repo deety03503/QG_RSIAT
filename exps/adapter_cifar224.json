@@ -11,7 +11,7 @@
     "device": ["0"],
     "seed": [1993],
     "class_order_seed": 1993,
-    "num_worker": 8,
+    "num_worker": 2,
 
     "aligner": "rae",
     "lambda_qrel": 0.0,
