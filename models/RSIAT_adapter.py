@@ -25,10 +25,43 @@ class Learner(BaseLearner):
         self.weight_decay = args["weight_decay"] if args["weight_decay"] is not None else 0.0005
         self.min_lr = args['min_lr'] if args['min_lr'] is not None else 1e-8
         self.args = args
+        uses_quantum_ops = (
+            args.get("aligner", "rae") == "qhybrid"
+            or (
+                args.get("lambda_qrel", 0.0) > 0
+                and args.get("kernel", "quantum") == "quantum"
+            )
+            or args.get("orth", "plain") == "qweighted"
+            or args.get("rs_kernel", "cosine") == "quantum"
+        )
+        self.use_amp = (
+            bool(args.get("use_amp", True))
+            and self._device.type == "cuda"
+            and not uses_quantum_ops
+        )
+        if (
+            bool(args.get("use_amp", True))
+            and self._device.type == "cuda"
+            and uses_quantum_ops
+        ):
+            logging.info(
+                "Automatic mixed precision is disabled for quantum-simulator runs"
+            )
+        self.amp_dtype = (
+            torch.bfloat16
+            if self.use_amp and torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
 
         self.logit_norm = None
         self.tuned_epochs = None
         self.rs_loss_func = RS_Loss(self.args["alpha"], self.args["rs_margin"])
+        self.loss_cos = AngularPenaltySMLoss(
+            loss_type='cosface',
+            eps=1e-7,
+            s=self.args["scale"],
+            m=self.args["margin"],
+        )
         self.old_ae = None
         self.quantum_feature_map = None
         self.quantum_aligner = None
@@ -69,16 +102,21 @@ class Learner(BaseLearner):
         model = model.eval()
         embedding_list = []
         label_list = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in trainloader:
                 (_, data, label) = batch
                 data = data.to(self._device, non_blocking=True)
-                outputs = model(data, return_features=True)
+                with torch.autocast(
+                    device_type=self._device.type,
+                    dtype=self.amp_dtype,
+                    enabled=self.use_amp,
+                ):
+                    outputs = model(data, return_features=True)
                 embedding = outputs["features"]
-                embedding_list.append(embedding.cpu())
+                embedding_list.append(embedding)
                 label_list.append(label)
 
-        embedding_list = torch.cat(embedding_list, dim=0)
+            embedding_list = torch.cat(embedding_list, dim=0).float().cpu()
         label_list = torch.cat(label_list, dim=0)
         return embedding_list, label_list
 
@@ -255,6 +293,17 @@ class Learner(BaseLearner):
             self._init_train(train_loader, test_loader, optimizer, scheduler, self.args['warmup_epoch'])
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler, warmup_epoch):
+        eval_interval = int(self.args.get("eval_interval", 1))
+        if eval_interval < 1:
+            raise ValueError("eval_interval must be a positive integer")
+        scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=self.use_amp and self.amp_dtype == torch.float16,
+        )
+        logging.info(
+            "Training precision: %s",
+            str(self.amp_dtype).replace("torch.", "") if self.use_amp else "float32",
+        )
         prog_bar = tqdm(
             range(self.tuned_epochs),
             desc=f"Task {self._cur_task + 1}",
@@ -266,31 +315,49 @@ class Learner(BaseLearner):
         info = None
         for epoch in prog_bar:
             self._network.train()
-            losses = 0.0
-            losses_c, losses_rt = 0.0, 0.0
+            losses = torch.zeros((), device=self._device)
+            losses_c = torch.zeros((), device=self._device)
+            losses_rt = torch.zeros((), device=self._device)
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self._device, non_blocking=True)
                 targets = targets.to(self._device, non_blocking=True)
-                _, loss_c, loss_rt = self._compute_rt_loss(inputs, targets, epoch, warmup_epoch)
-                loss = loss_c + loss_rt
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                losses += loss.item()
-                losses_c += loss_c.item()
-                losses_rt += loss_rt.item()
-                avg_loss = losses / (i + 1)
-                prog_bar.set_postfix(
-                    loss=f"{avg_loss:.3f}",
-                    refresh=False,
-                )
+                with torch.autocast(
+                    device_type=self._device.type,
+                    dtype=self.amp_dtype,
+                    enabled=self.use_amp,
+                ):
+                    _, loss_c, loss_rt = self._compute_rt_loss(
+                        inputs, targets, epoch, warmup_epoch
+                    )
+                    loss = loss_c + loss_rt
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                losses += loss.detach()
+                losses_c += loss_c.detach()
+                losses_rt += loss_rt.detach()
+                if (i + 1) % 20 == 0:
+                    prog_bar.set_postfix(
+                        loss=f"{(losses / (i + 1)).item():.3f}",
+                        refresh=False,
+                    )
             scheduler.step()
 
-            test_acc = self._compute_accuracy(self._network, test_loader)
-            avg_loss = losses / len(train_loader) if len(train_loader) else 0.0
-            avg_loss_c = losses_c / len(train_loader) if len(train_loader) else 0.0
-            avg_loss_rt = losses_rt / len(train_loader) if len(train_loader) else 0.0
+            should_evaluate = (
+                (epoch + 1) % eval_interval == 0
+                or epoch + 1 == self.tuned_epochs
+            )
+            test_acc = (
+                self._compute_accuracy(self._network, test_loader)
+                if should_evaluate
+                else None
+            )
+            num_batches = max(len(train_loader), 1)
+            avg_loss = losses.item() / num_batches
+            avg_loss_c = losses_c.item() / num_batches
+            avg_loss_rt = losses_rt.item() / num_batches
             info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Test_accy {:.2f}".format(
                 self._cur_task + 1,
                 epoch + 1,
@@ -298,14 +365,14 @@ class Learner(BaseLearner):
                 avg_loss,
                 avg_loss_c,
                 avg_loss_rt,
-                test_acc,
+                test_acc if test_acc is not None else float("nan"),
             )
             prog_bar.set_description(f"Task {self._cur_task + 1} Epoch {epoch + 1}/{self.tuned_epochs}")
             prog_bar.set_postfix(
                 loss=f"{avg_loss:.3f}",
                 loss_c=f"{avg_loss_c:.3f}",
                 loss_rt=f"{avg_loss_rt:.3f}",
-                acc=f"{test_acc:.2f}",
+                acc=f"{test_acc:.2f}" if test_acc is not None else "skipped",
                 refresh=True,
             )
         if info is not None:
@@ -391,11 +458,12 @@ class Learner(BaseLearner):
         return total_loss
         
     def _compute_rt_loss(self, inputs, targets, epoch=None, warmup_epoch=10):
-        loss_cos=AngularPenaltySMLoss(loss_type='cosface', eps=1e-7, s=self.args["scale"], m=self.args["margin"])
         outputs = self._network(inputs, return_features=True)
         features = outputs["features"]
         logits = outputs["logits"]
-        loss_c=loss_cos(logits[:, self._known_classes:], targets - self._known_classes)
+        loss_c = self.loss_cos(
+            logits[:, self._known_classes:], targets - self._known_classes
+        )
 
         if self._cur_task == 0:
             lambda_rs = self.args["lambda_rs"] * min(

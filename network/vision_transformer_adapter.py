@@ -5,6 +5,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from timm.models.layers import DropPath
 import timm
 from functools import partial
@@ -29,7 +30,6 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
 
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
@@ -39,26 +39,19 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
     def forward(self, x):
         B, N, C = x.shape
 
-        q = self.q_proj(x)
-        k = self._shape(self.k_proj(x), -1, B).view(B * self.num_heads, -1, self.head_dim)
-        v = self._shape(self.v_proj(x), -1, B).view(B * self.num_heads, -1, self.head_dim)
-        q = self._shape(q, N, B).view(B * self.num_heads, -1, self.head_dim)
-
-        attn_weights = torch.bmm(q, k.transpose(1, 2)) * self.scale
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-        attn_probs = self.attn_drop(attn_weights)
-        attn_output = torch.bmm(attn_probs, v)
-
-        attn_output = attn_output.view(B, self.num_heads, N, self.head_dim)
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(B, N, C)
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        attn_output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(attn_output)
         x = self.proj_drop(x)
@@ -378,4 +371,3 @@ def vit_base_patch16_224_in21k_adapter(pretrained=False, **kwargs):
         else:
             p.requires_grad = False
     return model
-

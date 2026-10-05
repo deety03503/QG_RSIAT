@@ -156,16 +156,24 @@ class BaseLearner(object):
 
     def _compute_accuracy(self, model, loader):
         model.eval()
-        correct, total = 0, 0
-        for i, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.to(self._device)
-            with torch.no_grad():
+        correct = torch.zeros((), device=self._device)
+        total = 0
+        use_amp = bool(getattr(self, "use_amp", False))
+        amp_dtype = getattr(self, "amp_dtype", torch.float16)
+        for _, inputs, targets in loader:
+            inputs = inputs.to(self._device, non_blocking=True)
+            targets = targets.to(self._device, non_blocking=True)
+            with torch.inference_mode(), torch.autocast(
+                device_type=self._device.type,
+                dtype=amp_dtype,
+                enabled=use_amp,
+            ):
                 outputs = model(inputs)["logits"]
             predicts = torch.max(outputs, dim=1)[1]
-            correct += (predicts.cpu() == targets).sum()
-            total += len(targets)
+            correct += (predicts == targets).sum()
+            total += targets.numel()
 
-        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+        return np.around(correct.item() * 100 / total, decimals=2)
 
     def _eval_cnn(self, loader):
         self._network.eval()

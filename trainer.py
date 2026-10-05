@@ -162,6 +162,8 @@ def _set_device(args):
             f"{visible_gpu_count} are visible to PyTorch"
         )
 
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     device_ids = list(range(gpu_count))
 
     selected_device_ids = set(device_ids)
