@@ -54,6 +54,11 @@ Both terminated during import with `ModuleNotFoundError: No module named
 caches were also absent. No training started and no new metric was produced.
 The smoke test was not run, as requested.
 
+The current `qr-rsiat` working tree now contains training/configuration
+changes after those historical runs. The recorded metrics are not results of
+the modified code and must not be used as proof that the changed seed handling,
+quantum components, or multi-GPU path preserve the baseline.
+
 ## Seed and protocol caveat
 
 The outline requires at least three training seeds while preserving class

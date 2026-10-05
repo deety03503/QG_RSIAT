@@ -129,7 +129,7 @@ are file paths and line numbers from base commit
   smoke test; they do not record full runtime/GPU/VRAM metadata and are not
   treated as proof that the current runtime or Kaggle inputs work.
 
-## Internal code with no discovered call site
+## Internal dead code identified at the base commit
 
 The following are candidates for the requested cleanup, based on repository-wide
 search of the current Python files. This is an internal-reference audit, not
@@ -152,13 +152,14 @@ proof that external consumers import these APIs:
 - `utils/ops.py` has no in-repository imports. Its augmentation classes do
   not appear in any configured pipeline.
 
-## Discrepancies and decisions needed before implementation
+## Discrepancies and decisions recorded at mapping time
 
 1. **Meaning of “remove unrelated code”:** the outline requires RSIAT-off
    behavior, original evaluation, baseline comparisons, classifier
    calibration, and multiple datasets, but does not list deletable files or
-   legacy features. Removing code/files by guess could violate those
-   requirements. No deletions have been made.
+   legacy features. The cleanup below therefore removed only the enumerated
+   in-repository dead code; all baseline, evaluation, calibration, and dataset
+   paths were retained.
 2. **Feature-map choice (confirmed):** use a trainable linear map from 768 to
    `q * lq` angles and subtract the per-batch angle mean. The outline's
    defaults remain `q=8`, `lq=2`.
@@ -179,18 +180,54 @@ proof that external consumers import these APIs:
    not available to verify from this local checkout. No results should be
    claimed until those runs happen on the specified runtime.
 7. **Internal dead-code cleanup:** the user confirmed the existing baseline
-   contains unused logic and wants that addressed. The list above has no
-   discovered in-repository caller. Remove those internals and their
-   now-unused imports when implementation begins; retain public APIs if
-   external scripts rely on them.
+   contains unused logic. The identified methods/helpers and `utils/ops.py`
+   have since been removed from this checkout; external consumers of these
+   previously unreferenced internals were not available for verification.
 
 ## Recommended safe scope
 
 Keep original RSIAT training, evaluation, dataset definitions and calibration
 available as the all-flags-off baseline. Implement QR-RSIAT as opt-in training
-features, and delete only code proven unreachable or redundant after checking
-all callers. Leave pre-existing user changes untouched. Phase 1 mapping and
-local syntax/config checks are complete; phase 0 remains incomplete until
-Kaggle inputs/runtime are inspected and a two-task smoke test plus runtime
-metadata are captured. Do not infer successful Kaggle or multi-GPU behavior
-from the historical full-run logs.
+features and delete only code proven unreachable or redundant after checking
+all callers. Leave pre-existing user changes untouched.
+
+## Implementation status (working tree; no implementation commits)
+
+- Added `quantum/` with a real PyTorch statevector simulator (RY gates and
+  nearest-neighbor CNOT chain), trainable centered `768 -> q*lq` angle map,
+  fidelity/cosine/RBF/MLP kernels, zero-initialized skip aligner, and qrel /
+  top-k qorth losses. Readout is Pauli-Z only, as confirmed by the user; angle
+  scaling is `pi * tanh(linear(features))`.
+- For the classical qrel controls, the RBF kernel defaults to `gamma=1/d`; the
+  MLP control is `tanh(cosine(x,y) + 1)`. These are explicit implementation
+  choices and should be held fixed in ablations.
+- Added CLI/config settings in `main.py` and all six experiment JSON files.
+  JSON is the default source; explicitly provided CLI values override it.
+  Baseline behavior remains the defaults (`aligner=rae`,
+  `lambda_qrel=0`, `orth=plain`, `rs_kernel=cosine`). qorth uses fixed
+  `orth_epsilon=0.5` as an initial config value; it still requires
+  train/validation-based selection before experiments.
+- Example opt-in run:
+
+  ```bash
+  python main.py --config ./exps/adapter_imagenetr.json --seed 1993 \
+    --device 0 --num_worker 8 --aligner qhybrid --lambda_qrel 1.0 \
+    --kernel quantum --orth qweighted
+  ```
+
+  `--rs_kernel quantum` enables the optional quantum base-task RS kernel.
+  Classical qrel comparisons can select `cosine`, `rbf`, or `mlp`.
+- Training RNG now follows the selected `seed`; class order is generated
+  independently from `class_order_seed=1993`. Loader worker count and seeded
+  generators are passed to train, test and class-mean DataLoaders.
+- Current-model training forward now goes through `DataParallel` and gathers
+  features/logits before loss computation. Classifier calibration and
+  feature-extraction custom methods are intentionally run through the
+  unwrapped module where appropriate. GPU IDs are validated and per-GPU model
+  and VRAM are logged.
+- Removed the dead-code candidates listed above, including the orphaned
+  `utils/ops.py`; baseline classifier, task evaluation, data loading, drift,
+  and Gaussian calibration code remain.
+- No tests have been run, as requested. Kaggle execution, seed reproducibility,
+  inference equivalence, and actual multi-GPU behavior remain unverified.
+  Phase 2's three-seed baseline is still incomplete.

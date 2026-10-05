@@ -37,6 +37,8 @@ RSIAT/
 
 The training and evaluation instructions for each dataset are in the "./args.sh" file. Each dataset can be calculated separately, and the results are stored in the "./logs" folder.
 
+To train with multiple GPUs, set the `device` list in the experiment JSON to the CUDA device IDs to use (for example, `"device": ["0", "1"]`), or pass them with `--device 0 1`. The model uses `torch.nn.DataParallel` across the listed GPUs; use a single ID for single-GPU training or `"cpu"` for CPU training.
+
 ## Citation
 
 If you find this useful in your research, please consider citing:
