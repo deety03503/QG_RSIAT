@@ -30,4 +30,19 @@ def merge_config(
     merged_values.update(explicit)
     validated = QRsiatConfig.from_mapping(merged_values).to_dict()
     result.update(validated)
+    beta = result.get("beta", 0.0)
+    gamma = result.get("gamma", 0.0)
+    for name, value in (("beta", beta), ("gamma", gamma)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Legacy {name} must be numeric for QR-RSIAT integration")
+    if validated["aligner"] == "qhybrid" and not any(
+        value > 0 for value in (beta, gamma)
+    ):
+        raise ValueError(
+            "The qhybrid aligner has no active objective: set positive beta or gamma."
+        )
+    if validated["lambda_qrel"] > 0 and beta <= 0:
+        raise ValueError("lambda_qrel > 0 requires a positive beta coefficient.")
+    if validated["orth"] == "qweighted" and gamma <= 0:
+        raise ValueError("--orth qweighted requires a positive gamma coefficient.")
     return result

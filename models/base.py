@@ -23,8 +23,9 @@ class BaseLearner(object):
         self._old_network = None
         self._data_memory, self._targets_memory = np.array([]), np.array([])
         self.topk = 5
-        self._device = args["device"][0]
-        self._multiple_gpus = args["device"]
+        runtime_context = args.get("runtime_context")
+        self._device = runtime_context.device if runtime_context is not None else args["device"][0]
+        self._multiple_gpus = []
 
     @property
     def exemplar_size(self):
@@ -43,13 +44,26 @@ class BaseLearner(object):
 
     @property
     def feature_dim(self):
-        if isinstance(self._network, nn.DataParallel):
-            return self._network.module.feature_dim
-        else:
-            return self._network.feature_dim
+        return self._network.feature_dim
 
 
     def _stage2_compact_classifier(self, task_size, ca_epochs=5):
+        context = getattr(self, "args", {}).get("runtime_context")
+        distributed = context is not None and context.world_size > 1
+        if distributed and context.rank != 0:
+            torch.distributed.barrier()
+            for tensor in self._network.fc.state_dict().values():
+                torch.distributed.broadcast(tensor, src=0)
+            torch.distributed.barrier()
+            return
+        self._stage2_compact_classifier_local(task_size, ca_epochs)
+        if distributed:
+            torch.distributed.barrier()
+            for tensor in self._network.fc.state_dict().values():
+                torch.distributed.broadcast(tensor, src=0)
+            torch.distributed.barrier()
+
+    def _stage2_compact_classifier_local(self, task_size, ca_epochs=5):
         for p in self._network.fc.parameters():
             p.requires_grad = True
 
@@ -63,9 +77,6 @@ class BaseLearner(object):
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=run_epochs)
 
         self._network.to(self._device)
-
-        if len(self._multiple_gpus) > 1:
-            self._network = nn.DataParallel(self._network, self._multiple_gpus)
 
         self._network.eval()
 
@@ -150,8 +161,9 @@ class BaseLearner(object):
         grouped = {k: float(v) for k, v in grouped.items()}
         ret["grouped"] = grouped
         ret["top1"] = grouped["total"]
-        ret["top{}".format(self.topk)] = float(np.around(
-            (y_pred.T == np.tile(y_true, (self.topk, 1))).sum() * 100 / len(y_true),
+        actual_k = min(self.topk, y_pred.shape[1])
+        ret["top{}".format(actual_k)] = float(np.around(
+            (y_pred.T == np.tile(y_true, (actual_k, 1))).sum() * 100 / len(y_true),
             decimals=2,
         ))
 
@@ -178,50 +190,60 @@ class BaseLearner(object):
         model.eval()
         correct, total = 0, 0
         for i, (_, inputs, targets) in enumerate(loader):
+            if getattr(self, "args", {}).get("smoke", False) and i >= 2:
+                break
             inputs = inputs.to(self._device)
             with torch.no_grad():
                 outputs = model(inputs)["logits"]
             predicts = torch.max(outputs, dim=1)[1]
             correct += (predicts.cpu() == targets).sum()
             total += len(targets)
-
+        if total == 0:
+            raise RuntimeError("Evaluation loader yielded no samples")
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
-        for _, (_, inputs, targets) in enumerate(loader):
+        for i, (_, inputs, targets) in enumerate(loader):
+            if getattr(self, "args", {}).get("smoke", False) and i >= 2:
+                break
             inputs = inputs.to(self._device)
             with torch.no_grad():
                 outputs = self._network(inputs)["logits"]
+            actual_k = min(self.topk, int(outputs.shape[1]))
+            if actual_k < 1:
+                raise ValueError("Model returned no class logits")
             predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+                outputs, k=actual_k, dim=1, largest=True, sorted=True
+            )[1]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
-        return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+        if not y_pred:
+            raise RuntimeError("Evaluation loader yielded no samples")
+        return np.concatenate(y_pred), np.concatenate(y_true)
 
 
     def _extract_vectors(self, loader):
         self._network.eval()
         vectors, targets = [], []
-        for _, _inputs, _targets in loader:
+        for index, (_, _inputs, _targets) in enumerate(loader):
+            if getattr(self, "args", {}).get("smoke", False) and index >= 2:
+                break
             _targets = _targets.numpy()
-            if isinstance(self._network, nn.DataParallel):
-                _vectors = tensor2numpy(
-                    self._network.module.extract_vector(_inputs.to(self._device))
-                )
-            else:
-                _vectors = tensor2numpy(
-                    self._network.extract_vector(_inputs.to(self._device))
-                )
+            _vectors = tensor2numpy(
+                self._network.extract_vector(_inputs.to(self._device))
+            )
 
             vectors.append(_vectors)
             targets.append(_targets)
 
+        if not vectors:
+            return (
+                np.empty((0, self.feature_dim), dtype=np.float32),
+                np.empty((0,), dtype=np.int64),
+            )
         return np.concatenate(vectors), np.concatenate(targets)
 
     def _compute_class_mean(self, data_manager, check_diff=False, oracle=False):
@@ -238,25 +260,74 @@ class BaseLearner(object):
             self._class_means = np.zeros((self._total_classes, self.feature_dim))
             self._class_covs = torch.zeros((self._total_classes, self.feature_dim, self.feature_dim))
 
-        radius = []
-        for class_idx in range(self._known_classes, self._total_classes):
+        from qrsiat.distributed.samplers import DistributedEvalSampler
+        from qrsiat.stats.accumulators import ClassStatisticsAccumulator
 
+        context = getattr(self, "args", {}).get("runtime_context")
+        plan = getattr(self, "args", {}).get("runtime_plan")
+        new_class_count = self._total_classes - self._known_classes
+        if new_class_count < 1:
+            raise RuntimeError("No new classes are available for class-statistics extraction")
+        accumulator = ClassStatisticsAccumulator(
+            new_class_count,
+            self.feature_dim,
+            device=self._device,
+        )
+        for class_idx in range(self._known_classes, self._total_classes):
             data, targets, idx_dataset = data_manager.get_dataset(np.arange(class_idx, class_idx + 1), source='train',
                                                                   mode='test', ret_data=True)
-            idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+            sampler = (
+                DistributedEvalSampler(
+                    idx_dataset,
+                    num_replicas=context.world_size,
+                    rank=context.rank,
+                )
+                if context is not None and context.world_size > 1
+                else None
+            )
+            workers = plan.num_workers if plan is not None else 4
+            loader_args = {
+                "dataset": idx_dataset,
+                "batch_size": batch_size,
+                "shuffle": False,
+                "sampler": sampler,
+                "num_workers": workers,
+            }
+            if workers:
+                loader_args["persistent_workers"] = bool(
+                    plan.persistent_workers if plan is not None else False
+                )
+                loader_args["prefetch_factor"] = int(
+                    plan.prefetch_factor if plan is not None and plan.prefetch_factor else 2
+                )
+            idx_loader = DataLoader(**loader_args)
             vectors, _ = self._extract_vectors(idx_loader)
-            class_mean = np.mean(vectors, axis=0)
-            if self._cur_task == 0:
-                cov = np.cov(vectors.T)+ np.eye(class_mean.shape[-1]) * 1e-4
-                radius.append(np.trace(cov) /768)
-            class_cov = torch.cov(torch.tensor(vectors, dtype=torch.float64).T) + torch.eye(class_mean.shape[-1]) * 1e-3
-
-            self._class_means[class_idx, :] = class_mean
-            self._class_covs[class_idx, ...] = class_cov
-
+            class_labels = torch.full(
+                (len(vectors),),
+                class_idx - self._known_classes,
+                dtype=torch.long,
+            )
+            accumulator.update(
+                torch.as_tensor(vectors, dtype=torch.float64),
+                class_labels,
+            )
+        statistics = accumulator.finalize(
+            covariance_epsilon=1e-3,
+            distributed=context is not None and context.world_size > 1,
+        )
+        means = statistics.means.cpu().numpy()
+        covariances = statistics.covariances.cpu()
+        new_slice = slice(self._known_classes, self._total_classes)
+        self._class_means[new_slice] = means
+        self._class_covs[new_slice] = covariances
         if self._cur_task == 0:
-                self.radius = np.sqrt(np.mean(radius))
-                print(self.radius)
+            per_class_radius = [
+                np.trace(covariances[index].numpy() + np.eye(self.feature_dim) * 1e-4)
+                / self.feature_dim
+                for index in range(new_class_count)
+            ]
+            self.radius = np.sqrt(np.mean(per_class_radius))
+            print(self.radius)
 
     def displacement_cov(self, Y, class_mean, embedding_old, sigma):
         cov = None

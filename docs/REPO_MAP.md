@@ -1,12 +1,14 @@
-# Bản đồ tĩnh repo RSIAT (G1)
+# Bản đồ repo RSIAT / QR-RSIAT
 
-Tài liệu này ghi nhận mã nguồn hiện có trước khi bắt đầu các thay đổi kiến trúc QR-RSIAT/Kaggle. Chỉ đọc mã; không chạy mô hình và không sửa file gốc.
+Tài liệu này bắt đầu là bản đồ mã nguồn G1 và đã được cập nhật sau khi tích hợp
+QR-RSIAT/Kaggle. Các kết luận về mã gốc phản ánh trạng thái trước tích hợp;
+phần trạng thái mới ở cuối tài liệu mô tả luồng hiện tại.
 
 ## Phạm vi và trạng thái
 
 - Kế hoạch tham chiếu: [`agents/AGENT_PLAN_v2_KIEN_TRUC_KAGGLE.md`](../agents/AGENT_PLAN_v2_KIEN_TRUC_KAGGLE.md), đặc biệt mục 5, giai đoạn G1.
 - Repo có lối vào `main.py`, `trainer.py`, `args.sh`; cấu hình thí nghiệm trong `exps/`; mã mô hình trong `models/`, `network/`, `utils/`; quản lý dữ liệu trong `data/`.
-- `docs/REPO_MAP.md` là sản phẩm duy nhất của G1. Chưa triển khai module mới hay sửa mã nguồn RSIAT.
+- `docs/REPO_MAP.md` là sản phẩm G1, hiện được duy trì làm bản đồ tổng quan.
 
 ## Cây mã liên quan
 
@@ -72,7 +74,8 @@ Tài liệu này ghi nhận mã nguồn hiện có trước khi bắt đầu cá
 
 ## Vấn đề đã làm rõ và quyết định triển khai
 
-Các quyết định sau do người dùng xác nhận sau khi hoàn tất G1. Đây là yêu cầu cho các giai đoạn tiếp theo, chưa có thay đổi mã nguồn nào được thực hiện.
+Các quyết định sau do người dùng xác nhận sau khi hoàn tất G1; trạng thái triển
+khai hiện tại được ghi trong phần G3–G8 bên dưới.
 
 | # | Vấn đề | Quyết định/phương án đã chốt | Điều vẫn cần kiểm tra khi triển khai |
 |---|---|---|---|
@@ -85,20 +88,71 @@ Các quyết định sau do người dùng xác nhận sau khi hoàn tất G1. �
 | 7 | Seed/thứ tự lớp | Seed mặc định là `1993`. Seed thí nghiệm điều khiển nguồn ngẫu nhiên; class order phải tách biệt với seed thí nghiệm để không đổi protocol ngoài ý muốn. | Không ghi đè seed cấu hình khi thiết lập RNG; giữ thứ tự lớp theo protocol được chọn. |
 | 8 | Tương thích môi trường | Kaggle dùng PyTorch/CUDA cài sẵn; dependencies bổ sung không cài lại `torch`/`torchvision`. Ghi nhận phiên bản runtime và fail-fast nếu không tương thích. | Đối chiếu phiên bản runtime Kaggle thực tế khi chạy lần đầu; chưa xác minh môi trường baseline ban đầu. |
 
-## Vấn đề mở còn lại
+## Vấn đề còn mở sau rà soát tĩnh
 
 - Cấu trúc và mapping class thực tế của dataset Kaggle chưa được quan sát; chỉ xác minh tĩnh từ code là chưa đủ.
-- Chưa có checkpoint để xác nhận schema, vị trí output và tính hợp lệ của resume. Mặc định “không có checkpoint hợp lệ thì chạy mới” đã được chốt, nhưng chi tiết schema sẽ được thiết kế ở giai đoạn checkpoint.
-- Chưa xác minh tên file/cache pretrained weights mà phiên Kaggle cung cấp; implementation cần dò và thông báo lỗi cụ thể.
+- Chưa có checkpoint thực tế để xác nhận schema, vị trí output và resume end-to-end. Schema và kiểm tra resume đã được triển khai; cần xác minh trên Kaggle.
+- Chưa xác minh checkpoint/cache pretrained thực tế mà phiên Kaggle cung cấp; implementation dò tên file và kiểm tra độ tương thích, nhưng chỉ Kaggle mới xác minh được artifacts đính kèm.
 - Chưa xác minh phiên bản Python/PyTorch/CUDA thực tế trên Kaggle hoặc phiên bản dùng cho baseline.
 
 ## Ranh giới G1
 
-G1 chỉ tạo bản đồ tĩnh; không chạy mô hình, không tái lập baseline, không viết test và không chỉnh sửa mã/config gốc.
+G1 chỉ tạo bản đồ tĩnh; không chạy mô hình, không tái lập baseline, không viết
+test và không chỉnh sửa mã/config gốc ở giai đoạn đó.
 
 ## Trạng thái G2
 
 - Đã tạo nền tảng package `qrsiat/`: schema/merge cấu hình, phát hiện phần cứng và lập runtime plan, callback OOM probe, runtime context/precision/optimization fallback, logging/seed/timing/atomic JSON/report.
 - Cấu hình mới mặc định seed `1993`; tương thích với `seed` dạng list trong các JSON RSIAT gốc và giữ nguyên các key legacy.
 - Tính năng tối ưu rủi ro (compile, frozen cast, gradient checkpointing, OOM probe) không tự chạy nếu không được gọi/bật. G2 không thay đổi `main.py`, trainer hoặc learner.
-- Chỉ kiểm tra tĩnh cú pháp và diagnostics; không chạy test, mô hình hoặc probe, cũng không xác nhận GPU/Kaggle runtime. Tích hợp vào luồng chạy RSIAT còn thuộc các giai đoạn sau.
+- Chỉ kiểm tra tĩnh cú pháp và diagnostics; không chạy test, mô hình hoặc
+  probe, cũng không xác nhận GPU/Kaggle runtime. Việc tích hợp vào luồng chạy
+  RSIAT thuộc các giai đoạn sau.
+
+## Trạng thái G3–G8 sau tích hợp
+
+- **G3:** `qrsiat/distributed`, `qrsiat/data`, `qrsiat/stats` được bổ sung.
+  Dataset ImageFolder được kiểm tra split/class count; CIFAR root có thể cấu
+  hình; class statistics và drift dùng sufficient statistics float64 cùng
+  collectives.
+- **G4:** `qrsiat/quantum` có simulator statevector thực, feature map, kernel,
+  qhybrid aligner và loss. Nhánh lượng tử được tắt theo mặc định và chạy trong
+  full precision khi bật.
+- **G5:** `qrsiat/training` có StepModule, warm-up, eval/checkpoint helpers.
+  Checkpoint task-boundary là atomic, hash-checked, lưu state khả huấn luyện,
+  prototypes/covariance, class order, metrics và RNG.
+- **G6:** Learner RSIAT dùng `RuntimeContext`, `StepModule`, sampler/loaders,
+  loss tùy chọn, checkpoint và distributed class statistics. Factory vẫn
+  đăng ký learner tại `utils/model_factory.py`.
+- **G7:** Có runner/queue, doctor, result collector, Kaggle bootstrap, ablation
+  JSON và `.gitignore` cho data/artifacts. `requirements-kaggle.txt` không
+  cài lại Torch/torchvision.
+- **G8:** Kiến trúc và các rủi ro lần chạy đầu nằm trong
+  [`ARCHITECTURE.md`](ARCHITECTURE.md) và
+  [`RISK_REGISTER.md`](RISK_REGISTER.md).
+
+### Luồng trọng số pretrained sau tích hợp
+
+`utils/inc_net.py` gọi `find_pretrained_checkpoint()` cho hai loại adapter
+ViT-B/16. Thứ tự ưu tiên là `--pretrained_weights`, checkpoint nhận diện được
+trong Kaggle input, rồi timm pretrained cache/download. Nếu có checkpoint chỉ
+nạp khi ít nhất 70% số tham số backbone có shape tương thích; nếu không đạt thì
+dừng với `ValueError`, không âm thầm dùng backbone ngẫu nhiên.
+
+### Điểm sửa mã RSIAT gốc
+
+- `main.py`, `trainer.py`: CLI/config/runtime, seed/device, report, metrics và
+  checkpoint.
+- `models/RSIAT_adapter.py`, `models/base.py`: StepModule/DDP, thống kê, eval,
+  classifier compensation và resume.
+- `data/data.py`: configurable CIFAR root.
+- `utils/inc_net.py`, `network/vision_transformer_adapter.py`: offline
+  pretrained lookup và kiểm tra tương thích trọng số.
+- `.gitignore`: dataset, checkpoint, log và output artifacts.
+
+### Ranh giới kiểm chứng hiện tại
+
+Không chạy test, mô hình, probe, DDP, baseline hay Kaggle runtime trên máy local
+không có GPU. Diagnostics tĩnh không xác minh được GPU memory, NCCL, dữ liệu
+đính kèm, quyền tạo symlink, checkpoint thực tế hay độ chính xác thực nghiệm.
+Các điểm đó được ghi trong [`RISK_REGISTER.md`](RISK_REGISTER.md).

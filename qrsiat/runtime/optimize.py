@@ -101,26 +101,42 @@ def enable_gradient_checkpointing(
     return False
 
 
+class FrozenParameterCast:
+    """Keep original parameter storage available for an execution fallback."""
+
+    def __init__(self, changed: list[tuple[Any, Any]]) -> None:
+        self._changed = changed
+
+    def restore(self) -> bool:
+        if not self._changed:
+            return False
+        for parameter, original_cpu in reversed(self._changed):
+            parameter.data = original_cpu.to(device=parameter.device)
+        self._changed.clear()
+        return True
+
+
 def cast_frozen_parameters(
     module: Any,
     dtype: Any,
     *,
     enabled: bool = False,
     logger: logging.Logger | None = None,
-) -> bool:
-    """Cast frozen parameters only; restore all changed tensors on failure."""
+) -> FrozenParameterCast | None:
+    """Cast frozen parameters and retain storage for an execution fallback."""
     if not enabled:
-        return False
+        return None
     log = logger or logging.getLogger(__name__)
     changed: list[tuple[Any, Any]] = []
     try:
         for parameter in module.parameters():
             if not parameter.requires_grad and parameter.is_floating_point():
-                changed.append((parameter, parameter.data))
+                original_cpu = parameter.data.detach().to(device="cpu", copy=True)
+                changed.append((parameter, original_cpu))
                 parameter.data = parameter.data.to(dtype=dtype)
     except Exception as exc:
         for parameter, original in reversed(changed):
-            parameter.data = original
+            parameter.data = original.to(device=parameter.device)
         log.warning("Frozen-backbone cast failed; restored original dtypes: %s", exc)
-        return False
-    return bool(changed)
+        return None
+    return FrozenParameterCast(changed) if changed else None

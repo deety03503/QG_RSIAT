@@ -9,6 +9,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .platform_kaggle import (
+    cgroup_memory_limit_bytes,
+    is_colab,
+    is_kaggle,
+    linux_memory_total_bytes,
+)
 
 @dataclass(frozen=True)
 class GPUProfile:
@@ -53,29 +59,13 @@ def _cpu_count() -> int:
 
 
 def _read_memory_limit() -> int | None:
-    candidates = (
-        Path("/sys/fs/cgroup/memory.max"),
-        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-    )
-    for path in candidates:
-        try:
-            value = path.read_text(encoding="ascii").strip()
-            if value and value != "max":
-                limit = int(value)
-                if 0 < limit < (1 << 60):
-                    return limit
-        except (OSError, ValueError):
-            continue
-    return None
+    return cgroup_memory_limit_bytes()
 
 
 def _ram_bytes() -> int | None:
-    try:
-        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
-            if line.startswith("MemTotal:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
+    memory = linux_memory_total_bytes()
+    if memory is not None:
+        return memory
 
     try:
         import psutil  # type: ignore[import-not-found]
@@ -86,9 +76,9 @@ def _ram_bytes() -> int | None:
 
 
 def _platform_name() -> str:
-    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or Path("/kaggle/working").is_dir():
+    if is_kaggle():
         return "kaggle"
-    if os.environ.get("COLAB_RELEASE_TAG") or Path("/content").is_dir():
+    if is_colab():
         return "colab"
     return "local"
 

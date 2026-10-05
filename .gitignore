@@ -28,3 +28,13 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Datasets, pretrained weights, and training artifacts
+datasets/
+data/datasets/
+*.pth
+*.pt
+*.pkl
+logs/
+outputs/
+out/

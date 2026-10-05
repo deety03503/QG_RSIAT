@@ -16,7 +16,7 @@ def probe_batch_size(
     safety_fraction: float = 0.9,
     logger: logging.Logger | None = None,
 ) -> int:
-    """Return the largest passing candidate with a safety margin.
+    """Return the largest passing candidate, applying margin only after OOM.
 
     `run_step(batch_size)` owns model/input construction and one forward/backward.
     The probe does not run unless explicitly called by its runtime integrator.
@@ -85,5 +85,9 @@ def probe_batch_size(
                 raise RuntimeError("CUDA out of memory even at batch size 1; no safe batch was found")
             return max(1, min(fallback_batch, ordered[0] // 2))
         return fallback_batch
-    safe_batch = max(1, math.floor(best * safety_fraction))
+    safe_batch = (
+        max(1, math.floor(best * safety_fraction))
+        if oom_observed
+        else best
+    )
     return safe_batch
