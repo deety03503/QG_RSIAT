@@ -70,17 +70,28 @@ Tài liệu này ghi nhận mã nguồn hiện có trước khi bắt đầu cá
 - Batch size của train/eval loader lấy từ config, nhưng `num_workers=8` được truyền trực tiếp cho loader trong `RSIAT_adapter.py`; biến module `num_workers=8` không được dùng tại các lời gọi đó. Loader tính thống kê trong `BaseLearner` dùng batch size module `64` và `num_workers=4` ([`models/RSIAT_adapter.py`](../models/RSIAT_adapter.py#L18), [`models/RSIAT_adapter.py`](../models/RSIAT_adapter.py#L87), [`models/base.py`](../models/base.py#L11), [`models/base.py`](../models/base.py#L246)).
 - Log là file + stdout theo cấu trúc `logs/...`; trainer có đoạn lưu checkpoint theo task nhưng đang comment. `BaseLearner.save_checkpoint()` tồn tại và gọi `torch.save`, nhưng không thấy được gọi trong luồng huấn luyện hiện tại ([`trainer.py`](../trainer.py#L28), [`trainer.py`](../trainer.py#L75), [`models/base.py`](../models/base.py#L136)).
 
-## Vấn đề mở
+## Vấn đề đã làm rõ và quyết định triển khai
 
-1. **Hợp đồng CPU/device:** cấu hình hiện để device dạng list string, `_set_device()` có nhánh `device_type == -1` không khớp kiểu list thông thường, còn `extract_features()` gọi `.cuda()` trực tiếp. Cần xác nhận/thiết kế đường CPU và mapping device khi thực hiện refactor; G1 không thay đổi các chỗ này.
-2. **Gốc dữ liệu:** README chỉ dẫn `datasets/<tên>/`, nhưng code yêu cầu hoặc tự tải xuống `./data/datasets/...`. Chưa xác minh cấu trúc dữ liệu thực tế mà tác giả dùng ở từng dataset và cách bố trí trên Kaggle.
-3. **Weights pretrained:** backbone gọi timm với `pretrained=True`, nhưng chưa xác minh checkpoint cache, tên file, yêu cầu internet, hoặc cách cung cấp offline trên Kaggle. Helper nạp checkpoint thủ công không thấy được gọi.
-4. **Class order/ImageFolder:** code định nghĩa class order bằng dãy chỉ số cố định cho từng wrapper, nhưng chưa xác minh các thư mục ImageFolder có cùng mapping class-index như giả định; VTAB còn in class mapping để quan sát. Không suy đoán mapping ngoài nội dung mã.
-5. **Prototype/covariance:** chưa có xử lý phân tán; covariance được tạo bằng `torch.cov` từ feature NumPy và class means/covariances là state trong bộ nhớ. Cách bảo toàn/chuyển đổi đầy đủ trạng thái này khi resume hoặc chia rank chưa có trong mã gốc.
-6. **Đánh giá:** `topk=5` được đặt trong `BaseLearner`; chưa xác minh giao thức mong muốn cho dataset có số class nhỏ hơn 5. Không chạy để kiểm tra.
-7. **Tái lập seed:** `_set_random()` đặt seed cố định `1` cho torch/CUDA thay vì lấy seed hiện tại trong args; chưa xác minh đây là chủ ý hay lỗi của mã gốc.
-8. **Tương thích môi trường:** README yêu cầu CUDA 11.8/Python 3.10, trong khi `requirements.txt` pin torch/torchvision bản `+cu126`; chưa xác minh đây là môi trường đã dùng để tạo kết quả.
+Các quyết định sau do người dùng xác nhận sau khi hoàn tất G1. Đây là yêu cầu cho các giai đoạn tiếp theo, chưa có thay đổi mã nguồn nào được thực hiện.
+
+| # | Vấn đề | Quyết định/phương án đã chốt | Điều vẫn cần kiểm tra khi triển khai |
+|---|---|---|---|
+| 1 | Hợp đồng CPU/device | Dùng `RuntimeContext` làm nguồn device duy nhất; CPU dùng được cho chẩn đoán, còn huấn luyện CPU nếu không được hỗ trợ thì phải dừng sớm và nêu rõ. Không hardcode CUDA. | Các đường `.cuda()` và `DataParallel` đã liệt kê ở trên phải được thay/đưa qua context nhất quán. |
+| 2 | Gốc dữ liệu | Dùng `--data_root`/`DATA_ROOT`, fallback đường dẫn RSIAT tương thích, và trên Kaggle dò `/kaggle/input`; tạo symlink tương thích khi xác định được dataset. | Xác nhận tồn tại/cấu trúc train-test trước khi tạo loader; nếu thiếu dữ liệu thì báo chính xác dataset cần gắn. |
+| 3 | Weights pretrained | Dùng checkpoint/cache có sẵn trước; thiếu weights thì báo rõ mô hình/đường dẫn cần cung cấp, không âm thầm dùng backbone ngẫu nhiên. | Xác thực checkpoint và khả năng nạp offline; chưa xác minh trước tên file/cache cụ thể của timm. |
+| 4 | Class order/ImageFolder | Kiểm tra mapping class train/test, số lượng và thứ tự lớp trước huấn luyện; ghi mapping đã dùng, không tự đoán hoặc âm thầm remap sai protocol. | Đối chiếu class mapping thực tế của các bộ dữ liệu được gắn trên Kaggle. |
+| 5 | Checkpoint/resume và thống kê | Tìm checkpoint trong thư mục output của repo/phiên hiện tại trước khi bắt đầu. Nếu tìm thấy checkpoint hợp lệ thì nạp state và tiếp tục; nếu không có checkpoint hợp lệ thì bắt đầu lượt chạy mới. Khi DDP, gộp count/tổng/tích theo lớp bằng `all_reduce(SUM)` trước khi tính mean/covariance. | Xác định schema/checkpoint đầy đủ (model khả huấn luyện, means/covariances, task, cấu hình/RNG); checkpoint không hợp lệ phải có cảnh báo rõ và không được xem như resume thành công. |
+| 6 | Đánh giá top-5 | Dùng `k=min(5, số lớp)` khi số lớp nhỏ hơn 5 và thể hiện rõ metric top-k thực tế. | Đảm bảo nhãn/tên metric trong báo cáo không gọi top-k thấp hơn là top-5. |
+| 7 | Seed/thứ tự lớp | Seed mặc định là `1993`. Seed thí nghiệm điều khiển nguồn ngẫu nhiên; class order phải tách biệt với seed thí nghiệm để không đổi protocol ngoài ý muốn. | Không ghi đè seed cấu hình khi thiết lập RNG; giữ thứ tự lớp theo protocol được chọn. |
+| 8 | Tương thích môi trường | Kaggle dùng PyTorch/CUDA cài sẵn; dependencies bổ sung không cài lại `torch`/`torchvision`. Ghi nhận phiên bản runtime và fail-fast nếu không tương thích. | Đối chiếu phiên bản runtime Kaggle thực tế khi chạy lần đầu; chưa xác minh môi trường baseline ban đầu. |
+
+## Vấn đề mở còn lại
+
+- Cấu trúc và mapping class thực tế của dataset Kaggle chưa được quan sát; chỉ xác minh tĩnh từ code là chưa đủ.
+- Chưa có checkpoint để xác nhận schema, vị trí output và tính hợp lệ của resume. Mặc định “không có checkpoint hợp lệ thì chạy mới” đã được chốt, nhưng chi tiết schema sẽ được thiết kế ở giai đoạn checkpoint.
+- Chưa xác minh tên file/cache pretrained weights mà phiên Kaggle cung cấp; implementation cần dò và thông báo lỗi cụ thể.
+- Chưa xác minh phiên bản Python/PyTorch/CUDA thực tế trên Kaggle hoặc phiên bản dùng cho baseline.
 
 ## Ranh giới G1
 
-G1 chỉ tạo bản đồ tĩnh này. Không chạy mô hình, không tái lập baseline, không viết test, và không chỉnh sửa mã/config gốc. Những vấn đề trên được để mở cho các giai đoạn tiếp theo; chưa giả định chúng đã được giải quyết.
+G1 chỉ tạo bản đồ tĩnh này. Không chạy mô hình, không tái lập baseline, không viết test, và không chỉnh sửa mã/config gốc. Các quyết định ở trên được ghi nhận cho G2–G8; chúng chưa được triển khai hoặc kiểm chứng runtime.
