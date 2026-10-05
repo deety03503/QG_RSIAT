@@ -3,7 +3,6 @@
 # https://github.com/jxhe/unify-parameter-efficient-tuning
 # --------------------------------------------------------
 import math
-import os
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -337,94 +336,22 @@ def vit_base_patch16_224_adapter(pretrained=False, **kwargs):
 
 
 def _find_local_vit_in21k_checkpoint():
-    checkpoint_names = ("pytorch_model.bin", "model.safetensors")
-    roots = []
-    configured_dir = os.environ.get("RSIAT_BACKBONE_DIR")
-    if configured_dir:
-        roots.append(Path(configured_dir).expanduser())
-    roots.append(Path("/kaggle/input"))
-
-    candidates = []
-    for root in roots:
-        if root.is_file() and root.name in checkpoint_names:
-            candidates.append(root)
-            continue
-        if not root.is_dir():
-            continue
-        search_roots = [root]
-        if root == Path("/kaggle/input"):
-            candidates.extend(
-                path for name in checkpoint_names for path in root.glob(name)
-            )
-            search_roots = [
-                path for path in root.iterdir()
-                if path.is_dir()
-                and "vit" in path.name.lower()
-                and "21k" in path.name.lower()
-            ]
-        candidates.extend(
-            path for search_root in search_roots
-            for name in checkpoint_names
-            for path in search_root.rglob(name)
-        )
-
-    candidates = sorted(
-        set(candidates),
-        key=lambda path: (
-            next(
-                (
-                    index for index, root in enumerate(roots)
-                    if path == root or root in path.parents
-                ),
-                len(roots),
-            ),
-            checkpoint_names.index(path.name),
-            str(path).lower(),
-        ),
+    checkpoint_path = (
+        Path(__file__).resolve().parent.parent
+        / "vit-base-patch16-224-in21k"
+        / "pytorch_model.bin"
     )
-    model_candidates = [
-        path for path in candidates
-        if any(
-            "vit" in part.lower()
-            and "patch16" in part.lower().replace("-", "").replace("_", "")
-            and "21k" in part.lower()
-            for part in path.parts
-        )
-    ]
-    if model_candidates:
-        return model_candidates[0]
-    if len(candidates) == 1:
-        return candidates[0]
-
-    searched = ", ".join(str(root) for root in roots)
-    if candidates:
-        found = ", ".join(str(path) for path in candidates[:5])
+    if not checkpoint_path.is_file():
         raise FileNotFoundError(
-            "Could not uniquely identify the ViT-IN21K checkpoint in "
-            f"{searched}. Found: {found}. Set RSIAT_BACKBONE_DIR to its folder."
+            "Local ViT-IN21K checkpoint was not found: {}".format(checkpoint_path)
         )
-    raise FileNotFoundError(
-        "ViT-IN21K checkpoint was not found locally. Add it to Kaggle Input "
-        "or set RSIAT_BACKBONE_DIR to the mounted model folder. Searched: "
-        f"{searched}"
-    )
+    return checkpoint_path
 
 
 def _load_huggingface_vit_state_dict(checkpoint_path):
-    if checkpoint_path.suffix == ".safetensors":
-        try:
-            from safetensors.torch import load_file
-        except ImportError as error:
-            raise ImportError(
-                "The local checkpoint is safetensors, but safetensors is not "
-                "installed. Add pytorch_model.bin to Kaggle Input or install "
-                "safetensors."
-            ) from error
-        state_dict = load_file(str(checkpoint_path), device="cpu")
-    else:
-        state_dict = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=True
-        )
+    state_dict = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=True
+    )
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
     return state_dict
@@ -491,7 +418,7 @@ def vit_base_patch16_224_in21k_adapter(pretrained=False, **kwargs):
     ]
     if missing_backbone:
         raise RuntimeError(
-            "Local ViT-IN21K checkpoint did not load all backbone weights. "
+            "Repository ViT-IN21K checkpoint did not load all backbone weights. "
             "Missing keys include: {}".format(", ".join(missing_backbone[:10]))
         )
 
