@@ -3,6 +3,8 @@
 # https://github.com/jxhe/unify-parameter-efficient-tuning
 # --------------------------------------------------------
 import math
+import os
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -334,36 +336,164 @@ def vit_base_patch16_224_adapter(pretrained=False, **kwargs):
     return model
 
 
+def _find_local_vit_in21k_checkpoint():
+    checkpoint_names = ("pytorch_model.bin", "model.safetensors")
+    roots = []
+    configured_dir = os.environ.get("RSIAT_BACKBONE_DIR")
+    if configured_dir:
+        roots.append(Path(configured_dir).expanduser())
+    roots.append(Path("/kaggle/input"))
+
+    candidates = []
+    for root in roots:
+        if root.is_file() and root.name in checkpoint_names:
+            candidates.append(root)
+            continue
+        if not root.is_dir():
+            continue
+        search_roots = [root]
+        if root == Path("/kaggle/input"):
+            candidates.extend(
+                path for name in checkpoint_names for path in root.glob(name)
+            )
+            search_roots = [
+                path for path in root.iterdir()
+                if path.is_dir()
+                and "vit" in path.name.lower()
+                and "21k" in path.name.lower()
+            ]
+        candidates.extend(
+            path for search_root in search_roots
+            for name in checkpoint_names
+            for path in search_root.rglob(name)
+        )
+
+    candidates = sorted(
+        set(candidates),
+        key=lambda path: (
+            next(
+                (
+                    index for index, root in enumerate(roots)
+                    if path == root or root in path.parents
+                ),
+                len(roots),
+            ),
+            checkpoint_names.index(path.name),
+            str(path).lower(),
+        ),
+    )
+    model_candidates = [
+        path for path in candidates
+        if any(
+            "vit" in part.lower()
+            and "patch16" in part.lower().replace("-", "").replace("_", "")
+            and "21k" in part.lower()
+            for part in path.parts
+        )
+    ]
+    if model_candidates:
+        return model_candidates[0]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    searched = ", ".join(str(root) for root in roots)
+    if candidates:
+        found = ", ".join(str(path) for path in candidates[:5])
+        raise FileNotFoundError(
+            "Could not uniquely identify the ViT-IN21K checkpoint in "
+            f"{searched}. Found: {found}. Set RSIAT_BACKBONE_DIR to its folder."
+        )
+    raise FileNotFoundError(
+        "ViT-IN21K checkpoint was not found locally. Add it to Kaggle Input "
+        "or set RSIAT_BACKBONE_DIR to the mounted model folder. Searched: "
+        f"{searched}"
+    )
+
+
+def _load_huggingface_vit_state_dict(checkpoint_path):
+    if checkpoint_path.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file
+        except ImportError as error:
+            raise ImportError(
+                "The local checkpoint is safetensors, but safetensors is not "
+                "installed. Add pytorch_model.bin to Kaggle Input or install "
+                "safetensors."
+            ) from error
+        state_dict = load_file(str(checkpoint_path), device="cpu")
+    else:
+        state_dict = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=True
+        )
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    return state_dict
+
+
+def _map_huggingface_vit_state_dict(state_dict):
+    mapped_state = {}
+    prefix_map = {
+        "embeddings.patch_embeddings.projection.": "patch_embed.proj.",
+        "layernorm.": "norm.",
+    }
+    layer_prefix_map = {
+        "layernorm_before.": "norm1.",
+        "layernorm_after.": "norm2.",
+        "attention.attention.query.": "attn.q_proj.",
+        "attention.attention.key.": "attn.k_proj.",
+        "attention.attention.value.": "attn.v_proj.",
+        "attention.output.dense.": "attn.proj.",
+        "intermediate.dense.": "fc1.",
+        "output.dense.": "fc2.",
+    }
+
+    for name, value in state_dict.items():
+        while name.startswith(("module.", "vit.")):
+            name = name.split(".", 1)[1]
+
+        if name == "embeddings.cls_token":
+            mapped_state["cls_token"] = value
+        elif name == "embeddings.position_embeddings":
+            mapped_state["pos_embed"] = value
+        else:
+            for source_prefix, target_prefix in prefix_map.items():
+                if name.startswith(source_prefix):
+                    mapped_state[target_prefix + name[len(source_prefix):]] = value
+                    break
+            else:
+                if name.startswith("encoder.layer."):
+                    layer_and_name = name[len("encoder.layer."):]
+                    layer_index, separator, layer_name = layer_and_name.partition(".")
+                    if separator:
+                        for source_prefix, target_prefix in layer_prefix_map.items():
+                            if layer_name.startswith(source_prefix):
+                                mapped_state[
+                                    "blocks.{}.".format(layer_index)
+                                    + target_prefix
+                                    + layer_name[len(source_prefix):]
+                                ] = value
+                                break
+    return mapped_state
+
+
 def vit_base_patch16_224_in21k_adapter(pretrained=False, **kwargs):
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
                               norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
-    checkpoint_model = timm.create_model("vit_base_patch16_224_in21k", pretrained=True, num_classes=0)
-    state_dict = checkpoint_model.state_dict()
-    for key in list(state_dict.keys()):
-        if 'qkv.weight' in key:
-            qkv_weight = state_dict.pop(key)
-            q_weight = qkv_weight[:768]
-            k_weight = qkv_weight[768:768 * 2]
-            v_weight = qkv_weight[768 * 2:]
-            state_dict[key.replace('qkv.weight', 'q_proj.weight')] = q_weight
-            state_dict[key.replace('qkv.weight', 'k_proj.weight')] = k_weight
-            state_dict[key.replace('qkv.weight', 'v_proj.weight')] = v_weight
-        elif 'qkv.bias' in key:
-            qkv_bias = state_dict.pop(key)
-            q_bias = qkv_bias[:768]
-            k_bias = qkv_bias[768:768 * 2]
-            v_bias = qkv_bias[768 * 2:]
-            state_dict[key.replace('qkv.bias', 'q_proj.bias')] = q_bias
-            state_dict[key.replace('qkv.bias', 'k_proj.bias')] = k_bias
-            state_dict[key.replace('qkv.bias', 'v_proj.bias')] = v_bias
-    # second, modify the mlp.fc.weight to match fc.weight
-    for key in list(state_dict.keys()):
-        if 'mlp.fc' in key:
-            fc_weight = state_dict.pop(key)
-            state_dict[key.replace('mlp.', '')] = fc_weight
-
+    checkpoint_path = _find_local_vit_in21k_checkpoint()
+    print("Loading ViT-IN21K backbone from local checkpoint: {}".format(checkpoint_path))
+    state_dict = _map_huggingface_vit_state_dict(
+        _load_huggingface_vit_state_dict(checkpoint_path)
+    )
     msg = model.load_state_dict(state_dict, strict=False)
+    missing_backbone = [
+        name for name in msg.missing_keys if ".adaptmlp." not in name
+    ]
+    if missing_backbone:
+        raise RuntimeError(
+            "Local ViT-IN21K checkpoint did not load all backbone weights. "
+            "Missing keys include: {}".format(", ".join(missing_backbone[:10]))
+        )
 
     for name, p in model.named_parameters():
         if name in msg.missing_keys:
