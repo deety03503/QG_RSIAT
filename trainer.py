@@ -134,10 +134,26 @@ def _set_device(args):
 
     if len(configured) == 1 and str(configured[0]).lower() in ("cpu", "-1"):
         args["device"] = [torch.device("cpu")]
-        logging.info("Using CPU")
+        logging.info(
+            "PyTorch %s; using CPU; CUDA available=%s; visible GPUs=%d; "
+            "CUDA_VISIBLE_DEVICES=%s",
+            torch.__version__,
+            torch.cuda.is_available(),
+            torch.cuda.device_count(),
+            os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+        )
         return
     if any(str(device).lower() in ("cpu", "-1") for device in configured):
         raise ValueError("CPU cannot be combined with CUDA device ids")
+    visible_gpu_count = torch.cuda.device_count()
+    logging.info(
+        "PyTorch %s; CUDA available=%s; visible GPUs=%d; CUDA_VISIBLE_DEVICES=%s",
+        torch.__version__,
+        torch.cuda.is_available(),
+        visible_gpu_count,
+        os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+    )
+    logging.info("Configured CUDA device IDs: %s", configured)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA devices were configured, but CUDA is unavailable")
 
@@ -158,17 +174,20 @@ def _set_device(args):
             raise ValueError(f"CUDA device {index} was specified more than once")
         device_ids.append(index)
 
-    args["device"] = [torch.device(f"cuda:{index}") for index in device_ids]
-    for index in device_ids:
+    selected_device_ids = set(device_ids)
+    for index in range(visible_gpu_count):
         properties = torch.cuda.get_device_properties(index)
         free_memory, total_memory = torch.cuda.mem_get_info(index)
         logging.info(
-            "GPU %s: %s, VRAM %.2f GiB total / %.2f GiB free",
+            "Visible GPU %s%s: %s, VRAM %.2f GiB total / %.2f GiB free",
             index,
+            " (selected)" if index in selected_device_ids else "",
             properties.name,
             total_memory / (1024 ** 3),
             free_memory / (1024 ** 3),
         )
+
+    args["device"] = [torch.device(f"cuda:{index}") for index in device_ids]
 
 
 def _set_random(seed):

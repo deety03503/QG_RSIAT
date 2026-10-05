@@ -130,10 +130,20 @@ class Learner(BaseLearner):
         )
 
         if len(self._multiple_gpus) > 1:
-            print('Multiple GPUs')
             device_ids = [device.index for device in self._multiple_gpus]
             self._network = nn.DataParallel(
                 self._network, device_ids=device_ids, output_device=device_ids[0]
+            )
+            logging.info(
+                "Enabled torch.nn.DataParallel across configured GPUs %s; "
+                "primary device is cuda:%s",
+                device_ids,
+                device_ids[0],
+            )
+        else:
+            logging.info(
+                "Using single-GPU training on %s; torch.nn.DataParallel is disabled",
+                self._multiple_gpus[0],
             )
 
       
