@@ -16,6 +16,7 @@ class BaseLearner(object):
         self._cur_task = -1
         self._known_classes = 0
         self._total_classes = 0
+        self.task_sizes = []
         self._network = None
         self._old_network = None
         self.topk = 5
@@ -113,9 +114,8 @@ class BaseLearner(object):
                 losses += loss.item()
 
             scheduler.step()
-            test_acc = self._compute_accuracy(self._network, self.test_loader)
-            info = 'CA Task {} => Loss {:.3f}, Test_accy {:.3f}'.format(
-                self._cur_task, losses / self._total_classes, test_acc)
+            info = 'CA Task {} => Loss {:.3f}'.format(
+                self._cur_task, losses / self._total_classes)
             logging.info(info)
 
 
@@ -140,6 +140,18 @@ class BaseLearner(object):
             (y_pred.T == np.tile(y_true, (self.topk, 1))).sum() * 100 / len(y_true),
             decimals=2,
         ))
+        task_accuracies = []
+        class_start = 0
+        for task_size in self.task_sizes:
+            class_end = class_start + task_size
+            task_mask = (y_true >= class_start) & (y_true < class_end)
+            if task_mask.any():
+                task_accuracy = np.mean(
+                    y_pred[task_mask, 0] == y_true[task_mask]
+                ) * 100
+                task_accuracies.append(float(np.around(task_accuracy, decimals=2)))
+            class_start = class_end
+        ret["task_accuracies"] = task_accuracies
 
         return ret
 

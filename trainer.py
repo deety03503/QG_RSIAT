@@ -118,6 +118,19 @@ def _train(args):
         )
         logging.info("Trainable quantum parameters: {}".format(quantum_parameters))
         cnn_accy = model.eval_task()
+        task_accuracy_summary = ", ".join(
+            f"Task {task_index + 1}: {accuracy:.2f}%"
+            for task_index, accuracy in enumerate(cnn_accy["task_accuracies"])
+        )
+        logging.info(
+            "Task-wise accuracy after Task %s: %s",
+            task + 1,
+            task_accuracy_summary,
+        )
+        print(
+            f"Task-wise accuracy after Task {task + 1}: "
+            f"{task_accuracy_summary}"
+        )
         model.after_task()
         
         logging.info("CNN: {}".format(cnn_accy["grouped"]))

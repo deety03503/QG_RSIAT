@@ -123,6 +123,7 @@ class Learner(BaseLearner):
     def incremental_train(self, data_manager):
         self._network = self._network_module()
         self._cur_task += 1
+        self.task_sizes.append(data_manager.get_task_size(self._cur_task))
         
         if self._cur_task == 1:
             if self.args.get("aligner", "rae") == "rae":
@@ -195,7 +196,7 @@ class Learner(BaseLearner):
                 self.train_loader, self._network
             )
 
-        self._train(self.train_loader, self.test_loader)
+        self._train(self.train_loader)
         
         self._network = self._network_module()
 
@@ -217,7 +218,7 @@ class Learner(BaseLearner):
         if self._cur_task>0 and self.args['ca_epochs']>0 and self.args['ca'] is True:
             self._stage2_compact_classifier(task_size, self.args['ca_epochs'])
 
-    def _train(self, train_loader, test_loader):
+    def _train(self, train_loader):
         self._network.to(self._device)
         network = self._network_module()
         if self._cur_task == 0:
@@ -254,7 +255,7 @@ class Learner(BaseLearner):
                 
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.tuned_epochs, eta_min=self.min_lr)
             log_count_parameter(param_groups)
-            self._init_train(train_loader, test_loader, optimizer, scheduler, self.args['warmup_epoch'])
+            self._init_train(train_loader, optimizer, scheduler, self.args['warmup_epoch'])
         else:
             self.tuned_epochs = self.args['inc_epochs']
             param_groups = []
@@ -290,12 +291,9 @@ class Learner(BaseLearner):
 
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.tuned_epochs, eta_min=self.min_lr)
             log_count_parameter(param_groups)
-            self._init_train(train_loader, test_loader, optimizer, scheduler, self.args['warmup_epoch'])
+            self._init_train(train_loader, optimizer, scheduler, self.args['warmup_epoch'])
 
-    def _init_train(self, train_loader, test_loader, optimizer, scheduler, warmup_epoch):
-        eval_interval = int(self.args.get("eval_interval", 1))
-        if eval_interval < 1:
-            raise ValueError("eval_interval must be a positive integer")
+    def _init_train(self, train_loader, optimizer, scheduler, warmup_epoch):
         scaler = torch.amp.GradScaler(
             "cuda",
             enabled=self.use_amp and self.amp_dtype == torch.float16,
@@ -345,34 +343,23 @@ class Learner(BaseLearner):
                     )
             scheduler.step()
 
-            should_evaluate = (
-                (epoch + 1) % eval_interval == 0
-                or epoch + 1 == self.tuned_epochs
-            )
-            test_acc = (
-                self._compute_accuracy(self._network, test_loader)
-                if should_evaluate
-                else None
-            )
             num_batches = max(len(train_loader), 1)
             avg_loss = losses.item() / num_batches
             avg_loss_c = losses_c.item() / num_batches
             avg_loss_rt = losses_rt.item() / num_batches
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Test_accy {:.2f}".format(
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}".format(
                 self._cur_task + 1,
                 epoch + 1,
                 self.tuned_epochs,
                 avg_loss,
                 avg_loss_c,
                 avg_loss_rt,
-                test_acc if test_acc is not None else float("nan"),
             )
             prog_bar.set_description(f"Task {self._cur_task + 1} Epoch {epoch + 1}/{self.tuned_epochs}")
             prog_bar.set_postfix(
                 loss=f"{avg_loss:.3f}",
                 loss_c=f"{avg_loss_c:.3f}",
                 loss_rt=f"{avg_loss_rt:.3f}",
-                acc=f"{test_acc:.2f}" if test_acc is not None else "skipped",
                 refresh=True,
             )
         if info is not None:
