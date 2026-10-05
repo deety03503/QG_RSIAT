@@ -317,7 +317,7 @@ def _find_local_vit_in21k_checkpoint():
 
 def _load_huggingface_vit_state_dict(checkpoint_path):
     state_dict = torch.load(
-        checkpoint_path, map_location="cpu", weights_only=False
+        checkpoint_path, map_location="cpu", weights_only=True
     )
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
