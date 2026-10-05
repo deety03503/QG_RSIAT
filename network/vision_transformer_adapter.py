@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import DropPath
-import timm
 from functools import partial
 from collections import OrderedDict
 import torch
@@ -300,39 +299,7 @@ class VisionTransformer(nn.Module):
 def vit_base_patch16_224_adapter(pretrained=False, **kwargs):
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
                               norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-
-    checkpoint_model = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=0)
-    state_dict = checkpoint_model.state_dict()
-    for key in list(state_dict.keys()):
-        if 'qkv.weight' in key:
-            qkv_weight = state_dict.pop(key)
-            q_weight = qkv_weight[:768]
-            k_weight = qkv_weight[768:768 * 2]
-            v_weight = qkv_weight[768 * 2:]
-            state_dict[key.replace('qkv.weight', 'q_proj.weight')] = q_weight
-            state_dict[key.replace('qkv.weight', 'k_proj.weight')] = k_weight
-            state_dict[key.replace('qkv.weight', 'v_proj.weight')] = v_weight
-        elif 'qkv.bias' in key:
-            qkv_bias = state_dict.pop(key)
-            q_bias = qkv_bias[:768]
-            k_bias = qkv_bias[768:768 * 2]
-            v_bias = qkv_bias[768 * 2:]
-            state_dict[key.replace('qkv.bias', 'q_proj.bias')] = q_bias
-            state_dict[key.replace('qkv.bias', 'k_proj.bias')] = k_bias
-            state_dict[key.replace('qkv.bias', 'v_proj.bias')] = v_bias
-    for key in list(state_dict.keys()):
-        if 'mlp.fc' in key:
-            fc_weight = state_dict.pop(key)
-            state_dict[key.replace('mlp.', '')] = fc_weight
-
-    msg = model.load_state_dict(state_dict, strict=False)
-
-    for name, p in model.named_parameters():
-        if name in msg.missing_keys:
-            p.requires_grad = True
-        else:
-            p.requires_grad = False
-    return model
+    return _load_local_vit_in21k_weights(model)
 
 
 def _find_local_vit_in21k_checkpoint():
@@ -403,10 +370,7 @@ def _map_huggingface_vit_state_dict(state_dict):
     return mapped_state
 
 
-def vit_base_patch16_224_in21k_adapter(pretrained=False, **kwargs):
-    model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-                              norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-
+def _load_local_vit_in21k_weights(model):
     checkpoint_path = _find_local_vit_in21k_checkpoint()
     print("Loading ViT-IN21K backbone from local checkpoint: {}".format(checkpoint_path))
     state_dict = _map_huggingface_vit_state_dict(
@@ -422,9 +386,59 @@ def vit_base_patch16_224_in21k_adapter(pretrained=False, **kwargs):
             "Missing keys include: {}".format(", ".join(missing_backbone[:10]))
         )
 
-    for name, p in model.named_parameters():
-        if name in msg.missing_keys:
-            p.requires_grad = True
-        else:
-            p.requires_grad = False
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad = name in msg.missing_keys
     return model
+
+
+def load_local_vit_in21k_timm_weights(model):
+    checkpoint_path = _find_local_vit_in21k_checkpoint()
+    print("Loading ViT-IN21K backbone from local checkpoint: {}".format(checkpoint_path))
+    state_dict = _map_huggingface_vit_state_dict(
+        _load_huggingface_vit_state_dict(checkpoint_path)
+    )
+    timm_state = {}
+    for name, value in state_dict.items():
+        if name.startswith("blocks.") and ".attn.q_" in name:
+            prefix, projection = name.rsplit(".attn.", 1)
+            projection_name, parameter_name = projection.split(".", 1)
+            qkv_name = "{}.attn.qkv.{}".format(prefix, parameter_name)
+            timm_state.setdefault(qkv_name, {})[projection_name] = value
+        elif name.startswith("blocks.") and (
+            ".fc1." in name or ".fc2." in name
+        ):
+            prefix, parameter_name = name.rsplit(".", 1)
+            block_name, layer_name = prefix.rsplit(".", 1)
+            timm_state["{}.mlp.{}.{}".format(
+                block_name, layer_name, parameter_name
+            )] = value
+        else:
+            timm_state[name] = value
+
+    for name, projections in list(timm_state.items()):
+        if isinstance(projections, dict):
+            if set(projections) != {"q_proj", "k_proj", "v_proj"}:
+                raise RuntimeError(
+                    "Incomplete QKV weights in local ViT-IN21K checkpoint: "
+                    "{}".format(name)
+                )
+            timm_state[name] = torch.cat(
+                (projections["q_proj"], projections["k_proj"], projections["v_proj"]),
+                dim=0,
+            )
+
+    msg = model.load_state_dict(timm_state, strict=False)
+    if msg.missing_keys:
+        raise RuntimeError(
+            "Repository ViT-IN21K checkpoint did not load all timm backbone "
+            "weights. Missing keys include: {}".format(
+                ", ".join(msg.missing_keys[:10])
+            )
+        )
+    return model
+
+
+def vit_base_patch16_224_in21k_adapter(pretrained=False, **kwargs):
+    model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+                              norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return _load_local_vit_in21k_weights(model)

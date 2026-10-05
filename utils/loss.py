@@ -25,17 +25,24 @@ class AngularPenaltySMLoss(nn.Module):
     def forward(self, wf, labels):
         if self.loss_type == 'crossentropy':
             return self.cross_entropy(wf, labels)
-        else:
-            if self.loss_type == 'cosface':
-                numerator = self.s * (torch.diagonal(wf.transpose(0, 1)[labels]) - self.m)
-            if self.loss_type == 'arcface':
-                numerator = self.s * torch.cos(torch.acos(
-                    torch.clamp(torch.diagonal(wf.transpose(0, 1)[labels]), -1. + self.eps, 1 - self.eps)) + self.m)
-            if self.loss_type == 'sphereface':
-                numerator = self.s * torch.cos(self.m * torch.acos(
-                    torch.clamp(torch.diagonal(wf.transpose(0, 1)[labels]), -1. + self.eps, 1 - self.eps)))
+        logits = wf.float()
+        labels = labels.long()
+        rows = torch.arange(labels.shape[0], device=labels.device)
+        target = logits[rows, labels]
 
-            excl = torch.cat([torch.cat((wf[i, :y], wf[i, y + 1:])).unsqueeze(0) for i, y in enumerate(labels)], dim=0)
-            denominator = torch.exp(numerator) + torch.sum(torch.exp(self.s * excl), dim=1)
-            L = numerator - torch.log(denominator)
-            return -torch.mean(L)
+        if self.loss_type == 'cosface':
+            target = target - self.m
+        elif self.loss_type == 'arcface':
+            target = torch.cos(
+                torch.acos(torch.clamp(target, -1.0 + self.eps, 1.0 - self.eps))
+                + self.m
+            )
+        elif self.loss_type == 'sphereface':
+            target = torch.cos(
+                self.m
+                * torch.acos(torch.clamp(target, -1.0 + self.eps, 1.0 - self.eps))
+            )
+
+        logits = logits * self.s
+        logits[rows, labels] = target * self.s
+        return F.cross_entropy(logits, labels)

@@ -1,15 +1,14 @@
-import os
-from huggingface_hub import snapshot_download
+from pathlib import Path
 
-# Tạo thư mục chứa model
-local_dir = "./vit-base-patch16-224-in21k"
-os.makedirs(local_dir, exist_ok=True)
 
-# Tải các file cấu hình và trọng số PyTorch (bỏ qua các file của thư viện khác như JAX/TF để nhẹ hơn)
-snapshot_download(
-    repo_id="google/vit-base-patch16-224-in21k",
-    local_dir=local_dir,
-    ignore_patterns=["*.msgpack", "*.h5"]  # Bỏ qua Flax và TensorFlow weights
+checkpoint_path = (
+    Path(__file__).resolve().parent
+    / "vit-base-patch16-224-in21k"
+    / "pytorch_model.bin"
 )
+if not checkpoint_path.is_file():
+    raise FileNotFoundError(
+        "Local ViT-IN21K checkpoint was not found: {}".format(checkpoint_path)
+    )
 
-print(f"Đã tải xong! Các file nằm tại: {os.path.abspath(local_dir)}")
+print("Using local ViT-IN21K checkpoint: {}".format(checkpoint_path))

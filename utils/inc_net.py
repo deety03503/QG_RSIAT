@@ -10,11 +10,15 @@ def get_convnet(args, pretrained=False):
     name = args["convnet_type"].lower()
     # SimpleCIL or SimpleCIL w/ Finetune
     if name == "pretrained_vit_b16_224" or name == "vit_base_patch16_224":
-        model = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=0)
+        model = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0)
+        from network.vision_transformer_adapter import load_local_vit_in21k_timm_weights
+        model = load_local_vit_in21k_timm_weights(model)
         model.out_dim = 768
         return model.eval()
     elif name == "pretrained_vit_b16_224_in21k" or name == "vit_base_patch16_224_in21k":
-        model = timm.create_model("vit_base_patch16_224_in21k", pretrained=True, num_classes=0)
+        model = timm.create_model("vit_base_patch16_224_in21k", pretrained=False, num_classes=0)
+        from network.vision_transformer_adapter import load_local_vit_in21k_timm_weights
+        model = load_local_vit_in21k_timm_weights(model)
         model.out_dim = 768
         return model.eval()
 
@@ -185,5 +189,4 @@ class SimpleVitNet(BaseNet):
     def ca_forward(self, x):
         fc_out = self.fc(x)
         return fc_out
-
 
