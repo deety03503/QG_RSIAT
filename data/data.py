@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
@@ -50,12 +53,38 @@ class iCIFAR224(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100(
-            "./data/datasets", train=True, download=False
-        )
-        test_dataset = datasets.cifar.CIFAR100(
-            "./data/datasets", train=False, download=False
-        )
+        dataset_dir = Path(
+            os.environ.get(
+                "RSIAT_CIFAR100_DIR",
+                Path("./data/datasets") / "cifar-100-python",
+            )
+        ).expanduser()
+        if dataset_dir.name != "cifar-100-python":
+            raise ValueError(
+                "RSIAT_CIFAR100_DIR must point to the extracted "
+                "'cifar-100-python' directory, got: {}".format(dataset_dir)
+            )
+        if not all((dataset_dir / name).is_file() for name in ("train", "test", "meta")):
+            raise FileNotFoundError(
+                "CIFAR-100 Python files train, test, and meta were not found in "
+                "{}. Set RSIAT_CIFAR100_DIR to the extracted cifar-100-python "
+                "directory in Kaggle Input.".format(dataset_dir)
+            )
+
+        try:
+            train_dataset = datasets.cifar.CIFAR100(
+                str(dataset_dir.parent), train=True, download=False
+            )
+            test_dataset = datasets.cifar.CIFAR100(
+                str(dataset_dir.parent), train=False, download=False
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                "The mounted CIFAR-100 files in {} failed torchvision's "
+                "integrity check. Use the official extracted CIFAR-100 Python "
+                "archive (train/test/meta) and update RSIAT_CIFAR100_DIR. "
+                "Automatic download is disabled.".format(dataset_dir)
+            ) from error
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
