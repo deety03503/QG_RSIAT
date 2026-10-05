@@ -25,7 +25,7 @@ def parse_arguments():
         "--num_worker",
         type=int,
         default=None,
-        help="Number of GPUs/DDP processes; launch multi-GPU runs with torchrun.",
+        help="Requested GPU count (0 selects CPU); multi-GPU uses DataParallel.",
     )
     parser.add_argument("--data_loader_workers", type=int, default=None)
     parser.add_argument(

@@ -8,7 +8,6 @@ from utils.toolkit import count_parameters
 import os
 import random
 import numpy as np
-import torch.distributed as dist
 
 
 def RSIAT_train(args):
@@ -17,74 +16,15 @@ def RSIAT_train(args):
     if not seed_list:
         raise ValueError("seed must contain at least one run seed")
     configured_num_worker = args["num_worker"]
-    distributed_initialized_here = _configure_distributed(args)
-
-    try:
-        sum_seed = 0.0
-        for seed in seed_list:
-            run_args = copy.deepcopy(args)
-            run_args["seed"] = int(seed)
-            run_args["num_worker"] = configured_num_worker
-            sum_seed += _train(run_args)
-        avg_seed = sum_seed / len(seed_list)
-        if args["rank"] == 0:
-            print('Average Seed Accuracy (CNN):', avg_seed)
-            logging.info("Average Seed Accuracy (CNN): {}".format(avg_seed))
-    finally:
-        if distributed_initialized_here:
-            dist.destroy_process_group()
-
-
-def _configure_distributed(args):
-    if not isinstance(args["num_worker"], int) or isinstance(
-        args["num_worker"], bool
-    ):
-        raise ValueError("num_worker must be an integer GPU count")
-    if args["num_worker"] < 0:
-        raise ValueError("num_worker must be non-negative (0 selects CPU)")
-
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_world_size = int(
-        os.environ.get("LOCAL_WORLD_SIZE", str(world_size))
-    )
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    initialized_here = False
-
-    if dist.is_available() and dist.is_initialized():
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-    elif world_size > 1:
-        if args["num_worker"] != local_world_size:
-            raise ValueError(
-                f"num_worker ({args['num_worker']}) must match torchrun world size "
-                f"per node ({local_world_size})"
-            )
-        if not torch.cuda.is_available():
-            raise RuntimeError("torchrun DDP currently requires CUDA GPUs")
-        if not dist.is_nccl_available():
-            raise RuntimeError(
-                "Multi-GPU CUDA training requires a PyTorch build with NCCL support"
-            )
-        if local_rank >= torch.cuda.device_count():
-            raise RuntimeError(
-                f"LOCAL_RANK={local_rank} exceeds the {torch.cuda.device_count()} "
-                "visible CUDA devices"
-            )
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
-        initialized_here = True
-    elif args["num_worker"] > 1:
-        raise RuntimeError(
-            "Multiple GPUs now use DDP. Launch with torchrun "
-            "--standalone --nproc_per_node=<num_worker> main.py ..."
-        )
-
-    args["distributed"] = world_size > 1
-    args["rank"] = rank
-    args["world_size"] = world_size
-    args["local_rank"] = local_rank
-    return initialized_here
+    sum_seed = 0.0
+    for seed in seed_list:
+        run_args = copy.deepcopy(args)
+        run_args["seed"] = int(seed)
+        run_args["num_worker"] = configured_num_worker
+        sum_seed += _train(run_args)
+    avg_seed = sum_seed / len(seed_list)
+    print('Average Seed Accuracy (CNN):', avg_seed)
+    logging.info("Average Seed Accuracy (CNN): {}".format(avg_seed))
 
 def _train(args):
     if not isinstance(args["num_worker"], int) or isinstance(args["num_worker"], bool):
@@ -119,8 +59,7 @@ def _train(args):
     init_cls = 0 if args ["init_cls"] == args["increment"] else args["init_cls"]
     logs_name = "logs/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
     
-    is_main_process = args.get("rank", 0) == 0
-    if is_main_process and not os.path.exists(logs_name):
+    if not os.path.exists(logs_name):
         os.makedirs(logs_name)
 
     logfilename = "logs/{}/{}/{}/{}/{}_{}_{}".format(
@@ -132,29 +71,19 @@ def _train(args):
         args["seed"],
         args["convnet_type"],
     )
-    if is_main_process:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(filename)s] => %(message)s",
-            handlers=[
-                logging.FileHandler(filename=logfilename + ".log"),
-                logging.StreamHandler(sys.stdout),
-            ],
-            force=True,
-        )
-    else:
-        logging.basicConfig(
-            level=logging.ERROR,
-            handlers=[logging.NullHandler()],
-            force=True,
-        )
-    if args.get("distributed"):
-        dist.barrier()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(filename)s] => %(message)s",
+        handlers=[
+            logging.FileHandler(filename=logfilename + ".log"),
+            logging.StreamHandler(sys.stdout),
+        ],
+        force=True,
+    )
 
     _set_random(args["seed"])
     _set_device(args)
-    if is_main_process:
-        print_args(args)
+    print_args(args)
     data_manager = DataManager(
         args["dataset"],
         args["shuffle"],
@@ -164,8 +93,7 @@ def _train(args):
     )
     model = model_factory.get_model(args["model_name"], args)
 
-    if is_main_process:
-        print()
+    print()
     cnn_curve = {"top1": [], "top5": []}
     for task in range(data_manager.nb_tasks):
         logging.info("All params: {}".format(count_parameters(model._network)))
@@ -198,11 +126,10 @@ def _train(args):
             task + 1,
             task_accuracy_summary,
         )
-        if is_main_process:
-            print(
-                f"Task-wise accuracy after Task {task + 1}: "
-                f"{task_accuracy_summary}"
-            )
+        print(
+            f"Task-wise accuracy after Task {task + 1}: "
+            f"{task_accuracy_summary}"
+        )
         model.after_task()
         
         logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -214,19 +141,11 @@ def _train(args):
         logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
         logging.info("CNN top5 curve: {}".format(cnn_curve["top5"]))
 
-        if is_main_process:
-            print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
-            logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
+        print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
+        logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
     return sum(cnn_curve["top1"])/len(cnn_curve["top1"])
        
 def _set_device(args):
-    if args.get("distributed"):
-        local_rank = args["local_rank"]
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        args["device"] = [torch.device(f"cuda:{local_rank}")]
-        return
-
     gpu_count = args["num_worker"]
     if gpu_count == 0:
         args["device"] = [torch.device("cpu")]

@@ -1,13 +1,11 @@
 import logging
 import numpy as np
 import torch
-import torch.distributed as dist
 from torch import nn
 from tqdm.auto import tqdm
 from torch import optim
 from torch.nn import functional as F
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import log_count_parameter, seed_worker
@@ -68,6 +66,9 @@ class Learner(BaseLearner):
         self.quantum_feature_map = None
         self.quantum_aligner = None
         self._class_means_raw = None
+        self.gpu_count = (
+            torch.cuda.device_count() if self._device.type == "cuda" else 0
+        )
         self._initialize_quantum_modules()
 
     def _initialize_quantum_modules(self):
@@ -97,6 +98,13 @@ class Learner(BaseLearner):
         self._known_classes = self._total_classes
         self._network = self._network_module()
         self._old_network = self._network.copy().freeze()
+        if self.gpu_count >= 2:
+            device_ids = list(range(self.gpu_count))
+            self._old_network = nn.DataParallel(
+                self._old_network,
+                device_ids=device_ids,
+                output_device=device_ids[0],
+            )
         self.old_network_module_ptr = self._old_network
 
 
@@ -132,8 +140,6 @@ class Learner(BaseLearner):
                 self.old_ae = AutoencoderSigmoid(
                     input_dims=768, code_dims=self.args["ae_code_dims"]
                 ).to(self._device)
-        if self.distributed:
-            self._broadcast_auxiliary_state()
             
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         self._network.update_fc(data_manager.get_task_size(self._cur_task))
@@ -143,29 +149,15 @@ class Learner(BaseLearner):
                                                  mode="train")
 
         self.train_dataset = train_dataset
-        if self.rank == 0:
-            print("The number of training dataset:", len(self.train_dataset))
+        print("The number of training dataset:", len(self.train_dataset))
 
         self.data_manager = data_manager
         train_generator = torch.Generator()
-        train_generator.manual_seed(self.seed + self._cur_task + self.rank)
-        train_sampler = (
-            DistributedSampler(
-                train_dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=True,
-                seed=self.seed + self._cur_task,
-                drop_last=False,
-            )
-            if self.distributed
-            else None
-        )
+        train_generator.manual_seed(self.seed + self._cur_task)
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=self.batch_size,
-            shuffle=train_sampler is None,
-            sampler=train_sampler,
+            shuffle=True,
             num_workers=self.data_loader_workers,
             worker_init_fn=seed_worker,
             generator=train_generator,
@@ -198,19 +190,17 @@ class Learner(BaseLearner):
             persistent_workers=self.data_loader_workers > 0,
         )
 
-        if self.distributed:
+        if self.gpu_count >= 2:
+            device_ids = list(range(self.gpu_count))
             self._network.to(self._device)
-            self._network = DistributedDataParallel(
-                self._network,
-                device_ids=[self._device.index],
-                output_device=self._device.index,
-                find_unused_parameters=True,
+            self._network = nn.DataParallel(
+                self._network, device_ids=device_ids, output_device=device_ids[0]
             )
             logging.info(
-                "Enabled DistributedDataParallel on rank %s of %s at %s",
-                self.rank,
-                self.world_size,
-                self._device,
+                "Enabled torch.nn.DataParallel across visible GPUs %s; "
+                "primary device is cuda:%s",
+                device_ids,
+                device_ids[0],
             )
         elif self._device.type == "cuda":
             logging.info(
@@ -249,14 +239,7 @@ class Learner(BaseLearner):
         task_size = data_manager.get_task_size(self._cur_task)
 
         if self._cur_task>0 and self.args['ca_epochs']>0 and self.args['ca'] is True:
-            if self.distributed:
-                calibration_seed = self.seed + 20000 + self._cur_task
-                torch.manual_seed(calibration_seed)
-                torch.cuda.manual_seed_all(calibration_seed)
             self._stage2_compact_classifier(task_size, self.args['ca_epochs'])
-            if self.distributed:
-                for tensor in self._network_module().fc.state_dict().values():
-                    dist.broadcast(tensor, src=0)
 
     def _train(self, train_loader):
         self._network.to(self._device)
@@ -348,14 +331,11 @@ class Learner(BaseLearner):
             unit="epoch",
             dynamic_ncols=True,
             leave=True,
-            disable=self.rank != 0,
         )
 
         info = None
         for epoch in prog_bar:
             self._network.train()
-            if isinstance(train_loader.sampler, DistributedSampler):
-                train_loader.sampler.set_epoch(epoch)
             losses = torch.zeros((), device=self._device)
             losses_c = torch.zeros((), device=self._device)
             losses_rt = torch.zeros((), device=self._device)
@@ -374,9 +354,6 @@ class Learner(BaseLearner):
                     loss = loss_c + loss_rt
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
-                if self.distributed:
-                    self._synchronize_auxiliary_gradients(optimizer)
-                    scaler.unscale_(optimizer)
                 scaler.step(optimizer)
                 scaler.update()
                 losses += loss.detach()
@@ -410,31 +387,6 @@ class Learner(BaseLearner):
             )
         if info is not None:
             logging.info(info)
-
-    def _synchronize_auxiliary_gradients(self, optimizer):
-        network_parameter_ids = {
-            id(parameter) for parameter in self._network_module().parameters()
-        }
-        for group in optimizer.param_groups:
-            for parameter in group["params"]:
-                if (
-                    id(parameter) not in network_parameter_ids
-                    and parameter.grad is not None
-                ):
-                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
-                    parameter.grad.div_(self.world_size)
-
-    def _broadcast_auxiliary_state(self):
-        modules = (
-            self.old_ae,
-            self.quantum_feature_map,
-            self.quantum_aligner,
-        )
-        for module in modules:
-            if module is None:
-                continue
-            for tensor in module.state_dict().values():
-                dist.broadcast(tensor, src=0)
 
     def _alignment_module(self):
         return self.quantum_aligner if self.quantum_aligner is not None else self.old_ae
@@ -537,7 +489,9 @@ class Learner(BaseLearner):
             )
             return logits, loss_c, loss_base
         
-        features_old = self.old_network_module_ptr.extract_vector(inputs)
+        features_old = self.old_network_module_ptr(
+            inputs, return_features=True
+        )["features"]
         loss_inc = self._inc_loss(features, features_old, epoch)
         return logits, loss_c, loss_inc
     

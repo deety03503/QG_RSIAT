@@ -2,7 +2,6 @@ import logging
 import numpy as np
 import torch
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -23,20 +22,20 @@ class BaseLearner(object):
         self.topk = 5
         self.num_worker = args["num_worker"]
         self._device = args["device"][0]
+        self.gpu_count = (
+            torch.cuda.device_count() if self._device.type == "cuda" else 0
+        )
         self.data_loader_workers = args["data_loader_workers"]
         self.seed = int(args.get("seed", 1993))
-        self.distributed = bool(args.get("distributed", False))
-        self.rank = int(args.get("rank", 0))
-        self.world_size = int(args.get("world_size", 1))
 
     def _network_module(self):
-        if isinstance(self._network, (nn.DataParallel, DistributedDataParallel)):
+        if isinstance(self._network, nn.DataParallel):
             return self._network.module
         return self._network
 
     @property
     def feature_dim(self):
-        if isinstance(self._network, (nn.DataParallel, DistributedDataParallel)):
+        if isinstance(self._network, nn.DataParallel):
             return self._network.module.feature_dim
         else:
             return self._network.feature_dim
@@ -46,6 +45,12 @@ class BaseLearner(object):
         network = self._network_module()
         for p in network.fc.parameters():
             p.requires_grad = True
+
+        if self.gpu_count >= 2:
+            device_ids = list(range(self.gpu_count))
+            network.fc = nn.DataParallel(
+                network.fc, device_ids=device_ids, output_device=device_ids[0]
+            )
 
         run_epochs = ca_epochs
         crct_num = self._total_classes
@@ -121,6 +126,9 @@ class BaseLearner(object):
             info = 'CA Task {} => Loss {:.3f}'.format(
                 self._cur_task, losses / self._total_classes)
             logging.info(info)
+
+        if isinstance(network.fc, nn.DataParallel):
+            network.fc = network.fc.module
 
 
     def save_checkpoint(self, filename):
