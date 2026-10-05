@@ -574,6 +574,10 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         return [parameter for parameter in self._step_module.parameters() if parameter.requires_grad]
 
     def _append_step_parameters(self, groups, *, lr_scale=1):
+        # Some legacy groups provide one-shot parameter generators. Materialize
+        # them before checking identities so the optimizer still receives them.
+        for group in groups:
+            group["params"] = list(group["params"])
         existing = {
             id(parameter)
             for group in groups
@@ -631,6 +635,25 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                     scaler.scale(loss / divisor).backward()
                 should_step = (i + 1) % grad_accum_steps == 0 or i + 1 == len(train_loader)
                 if should_step:
+                    optimizer_parameters = [
+                        parameter
+                        for group in optimizer.param_groups
+                        for parameter in group["params"]
+                    ]
+                    parameters_with_grad = [
+                        parameter
+                        for parameter in optimizer_parameters
+                        if parameter.grad is not None
+                    ]
+                    if not parameters_with_grad:
+                        raise RuntimeError(
+                            "Training produced no gradients for any optimizer parameter "
+                            f"(task={self._cur_task}, epoch={epoch}, batch={i}, "
+                            f"optimizer={type(optimizer).__name__}, "
+                            f"loss_requires_grad={loss.requires_grad}). "
+                            "Check that the trainable StepModule parameters are connected "
+                            "to the selected loss."
+                        )
                     if scaler is None:
                         optimizer.step()
                     else:
