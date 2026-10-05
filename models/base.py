@@ -19,7 +19,7 @@ class BaseLearner(object):
         self._network = None
         self._old_network = None
         self.topk = 5
-        self._device = args["device"][0]
+        self._device = args["device"]
         self._multiple_gpus = args["device"]
         self.num_worker = args.get("num_worker", 8)
         self.seed = int(args.get("seed", 1993))
