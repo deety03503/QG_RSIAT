@@ -1,4 +1,5 @@
 import numpy as np
+import os
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
 
@@ -50,8 +51,9 @@ class iCIFAR224(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100("./data/datasets", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100("./data/datasets", train=False, download=True)
+        root = os.environ.get("RSIAT_CIFAR_ROOT", "./data/datasets")
+        train_dataset = datasets.cifar.CIFAR100(root, train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR100(root, train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )

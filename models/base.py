@@ -1,3 +1,4 @@
+import copy
 import logging
 import numpy as np
 import torch
@@ -6,8 +7,10 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.distributions.multivariate_normal import MultivariateNormal
-from utils.toolkit import tensor2numpy, accuracy, seed_worker
-
+from utils.toolkit import tensor2numpy, accuracy
+from scipy.spatial.distance import cdist
+import time
+EPSILON = 1e-8
 batch_size = 64
 
 
@@ -18,33 +21,55 @@ class BaseLearner(object):
         self._total_classes = 0
         self._network = None
         self._old_network = None
+        self._data_memory, self._targets_memory = np.array([]), np.array([])
         self.topk = 5
-        self.num_worker = args["num_worker"]
-        self._device = args["device"][0]
-        self.data_loader_workers = args["data_loader_workers"]
-        self.seed = int(args.get("seed", 1993))
+        runtime_context = args.get("runtime_context")
+        self._device = runtime_context.device if runtime_context is not None else args["device"][0]
+        self._multiple_gpus = []
 
-    def _network_module(self):
-        if isinstance(self._network, nn.DataParallel):
-            return self._network.module
-        return self._network
+    @property
+    def exemplar_size(self):
+        assert len(self._data_memory) == len(
+            self._targets_memory
+        ), "Exemplar size error."
+        return len(self._targets_memory)
+
+    @property
+    def samples_per_class(self):
+        if self._fixed_memory:
+            return self._memory_per_class
+        else:
+            assert self._total_classes != 0, "Total classes is 0"
+            return self._memory_size // self._total_classes
 
     @property
     def feature_dim(self):
-        if isinstance(self._network, nn.DataParallel):
-            return self._network.module.feature_dim
-        else:
-            return self._network.feature_dim
+        return self._network.feature_dim
 
 
     def _stage2_compact_classifier(self, task_size, ca_epochs=5):
-        network = self._network_module()
-        for p in network.fc.parameters():
+        context = getattr(self, "args", {}).get("runtime_context")
+        distributed = context is not None and context.world_size > 1
+        if distributed and context.rank != 0:
+            torch.distributed.barrier()
+            for tensor in self._network.fc.state_dict().values():
+                torch.distributed.broadcast(tensor, src=0)
+            torch.distributed.barrier()
+            return
+        self._stage2_compact_classifier_local(task_size, ca_epochs)
+        if distributed:
+            torch.distributed.barrier()
+            for tensor in self._network.fc.state_dict().values():
+                torch.distributed.broadcast(tensor, src=0)
+            torch.distributed.barrier()
+
+    def _stage2_compact_classifier_local(self, task_size, ca_epochs=5):
+        for p in self._network.fc.parameters():
             p.requires_grad = True
 
         run_epochs = ca_epochs
         crct_num = self._total_classes
-        param_list = [p for p in network.fc.parameters() if p.requires_grad]
+        param_list = [p for p in self._network.fc.parameters() if p.requires_grad]
         network_params = [{'params': param_list, 'lr': self.init_lr,
                            'weight_decay': self.weight_decay}]
 
@@ -86,7 +111,7 @@ class BaseLearner(object):
                 tgt = targets[_iter * num_sampled_pcls:(_iter + 1) * num_sampled_pcls]
 
                 # -stage two only use classifiers
-                outputs = network.ca_forward(inp)
+                outputs = self._network.ca_forward(inp)
                 logits = self.args['scale'] * outputs['logits']
 
                 if self.logit_norm is not None:
@@ -136,8 +161,9 @@ class BaseLearner(object):
         grouped = {k: float(v) for k, v in grouped.items()}
         ret["grouped"] = grouped
         ret["top1"] = grouped["total"]
-        ret["top{}".format(self.topk)] = float(np.around(
-            (y_pred.T == np.tile(y_true, (self.topk, 1))).sum() * 100 / len(y_true),
+        actual_k = min(self.topk, y_pred.shape[1])
+        ret["top{}".format(actual_k)] = float(np.around(
+            (y_pred.T == np.tile(y_true, (actual_k, 1))).sum() * 100 / len(y_true),
             decimals=2,
         ))
 
@@ -154,59 +180,70 @@ class BaseLearner(object):
     def _train(self):
         pass
 
+    def _get_memory(self):
+        if len(self._data_memory) == 0:
+            return None
+        else:
+            return (self._data_memory, self._targets_memory)
+
     def _compute_accuracy(self, model, loader):
         model.eval()
-        correct = torch.zeros((), device=self._device)
-        total = 0
-        use_amp = bool(getattr(self, "use_amp", False))
-        amp_dtype = getattr(self, "amp_dtype", torch.float16)
-        for _, inputs, targets in loader:
-            inputs = inputs.to(self._device, non_blocking=True)
-            targets = targets.to(self._device, non_blocking=True)
-            with torch.inference_mode(), torch.autocast(
-                device_type=self._device.type,
-                dtype=amp_dtype,
-                enabled=use_amp,
-            ):
+        correct, total = 0, 0
+        for i, (_, inputs, targets) in enumerate(loader):
+            if getattr(self, "args", {}).get("smoke", False) and i >= 2:
+                break
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
                 outputs = model(inputs)["logits"]
             predicts = torch.max(outputs, dim=1)[1]
-            correct += (predicts == targets).sum()
-            total += targets.numel()
-
-        return np.around(correct.item() * 100 / total, decimals=2)
+            correct += (predicts.cpu() == targets).sum()
+            total += len(targets)
+        if total == 0:
+            raise RuntimeError("Evaluation loader yielded no samples")
+        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
-        for _, (_, inputs, targets) in enumerate(loader):
+        for i, (_, inputs, targets) in enumerate(loader):
+            if getattr(self, "args", {}).get("smoke", False) and i >= 2:
+                break
             inputs = inputs.to(self._device)
             with torch.no_grad():
                 outputs = self._network(inputs)["logits"]
+            actual_k = min(self.topk, int(outputs.shape[1]))
+            if actual_k < 1:
+                raise ValueError("Model returned no class logits")
             predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+                outputs, k=actual_k, dim=1, largest=True, sorted=True
+            )[1]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
-        return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+        if not y_pred:
+            raise RuntimeError("Evaluation loader yielded no samples")
+        return np.concatenate(y_pred), np.concatenate(y_true)
 
 
     def _extract_vectors(self, loader):
         self._network.eval()
         vectors, targets = [], []
-        for _, _inputs, _targets in loader:
+        for index, (_, _inputs, _targets) in enumerate(loader):
+            if getattr(self, "args", {}).get("smoke", False) and index >= 2:
+                break
             _targets = _targets.numpy()
-            with torch.no_grad():
-                outputs = self._network(
-                    _inputs.to(self._device), return_features=True
-                )
-            _vectors = tensor2numpy(outputs["features"])
+            _vectors = tensor2numpy(
+                self._network.extract_vector(_inputs.to(self._device))
+            )
 
             vectors.append(_vectors)
             targets.append(_targets)
 
+        if not vectors:
+            return (
+                np.empty((0, self.feature_dim), dtype=np.float32),
+                np.empty((0,), dtype=np.int64),
+            )
         return np.concatenate(vectors), np.concatenate(targets)
 
     def _compute_class_mean(self, data_manager, check_diff=False, oracle=False):
@@ -216,46 +253,106 @@ class BaseLearner(object):
             new_class_means = np.zeros((self._total_classes, self.feature_dim))
             new_class_means[:self._known_classes] = self._class_means
             self._class_means = new_class_means
-            new_raw_means = np.zeros((self._total_classes, self.feature_dim))
-            new_raw_means[:self._known_classes] = self._class_means_raw
-            self._class_means_raw = new_raw_means
             new_class_cov = torch.zeros((self._total_classes, self.feature_dim, self.feature_dim))
             new_class_cov[:self._known_classes] = self._class_covs
             self._class_covs = new_class_cov
         elif not check_diff:
             self._class_means = np.zeros((self._total_classes, self.feature_dim))
-            self._class_means_raw = np.zeros((self._total_classes, self.feature_dim))
             self._class_covs = torch.zeros((self._total_classes, self.feature_dim, self.feature_dim))
 
-        radius = []
-        for class_idx in range(self._known_classes, self._total_classes):
+        from qrsiat.distributed.samplers import DistributedEvalSampler
+        from qrsiat.stats.accumulators import ClassStatisticsAccumulator
 
+        context = getattr(self, "args", {}).get("runtime_context")
+        plan = getattr(self, "args", {}).get("runtime_plan")
+        new_class_count = self._total_classes - self._known_classes
+        if new_class_count < 1:
+            raise RuntimeError("No new classes are available for class-statistics extraction")
+        accumulator = ClassStatisticsAccumulator(
+            new_class_count,
+            self.feature_dim,
+            device=self._device,
+        )
+        for class_idx in range(self._known_classes, self._total_classes):
             data, targets, idx_dataset = data_manager.get_dataset(np.arange(class_idx, class_idx + 1), source='train',
                                                                   mode='test', ret_data=True)
-            generator = torch.Generator()
-            generator.manual_seed(self.seed + class_idx)
-            idx_loader = DataLoader(
-                idx_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=self.data_loader_workers,
-                worker_init_fn=seed_worker,
-                generator=generator,
+            sampler = (
+                DistributedEvalSampler(
+                    idx_dataset,
+                    num_replicas=context.world_size,
+                    rank=context.rank,
+                )
+                if context is not None and context.world_size > 1
+                else None
             )
+            workers = plan.num_workers if plan is not None else 4
+            loader_args = {
+                "dataset": idx_dataset,
+                "batch_size": batch_size,
+                "shuffle": False,
+                "sampler": sampler,
+                "num_workers": workers,
+            }
+            if workers:
+                loader_args["persistent_workers"] = bool(
+                    plan.persistent_workers if plan is not None else False
+                )
+                loader_args["prefetch_factor"] = int(
+                    plan.prefetch_factor if plan is not None and plan.prefetch_factor else 2
+                )
+            idx_loader = DataLoader(**loader_args)
             vectors, _ = self._extract_vectors(idx_loader)
-            class_mean = np.mean(vectors, axis=0)
-            if self._cur_task == 0:
-                cov = np.cov(vectors.T)+ np.eye(class_mean.shape[-1]) * 1e-4
-                radius.append(np.trace(cov) /768)
-            class_cov = torch.cov(torch.tensor(vectors, dtype=torch.float64).T) + torch.eye(class_mean.shape[-1]) * 1e-3
-
-            self._class_means[class_idx, :] = class_mean
-            self._class_means_raw[class_idx, :] = class_mean
-            self._class_covs[class_idx, ...] = class_cov
-
+            class_labels = torch.full(
+                (len(vectors),),
+                class_idx - self._known_classes,
+                dtype=torch.long,
+            )
+            accumulator.update(
+                torch.as_tensor(vectors, dtype=torch.float64),
+                class_labels,
+            )
+        statistics = accumulator.finalize(
+            covariance_epsilon=1e-3,
+            distributed=context is not None and context.world_size > 1,
+        )
+        means = statistics.means.cpu().numpy()
+        covariances = statistics.covariances.cpu()
+        new_slice = slice(self._known_classes, self._total_classes)
+        self._class_means[new_slice] = means
+        self._class_covs[new_slice] = covariances
         if self._cur_task == 0:
-                self.radius = np.sqrt(np.mean(radius))
-                print(self.radius)
+            per_class_radius = [
+                np.trace(covariances[index].numpy() + np.eye(self.feature_dim) * 1e-4)
+                / self.feature_dim
+                for index in range(new_class_count)
+            ]
+            self.radius = np.sqrt(np.mean(per_class_radius))
+            print(self.radius)
+
+    def displacement_cov(self, Y, class_mean, embedding_old, sigma):
+        cov = None
+        start_time = time.time()
+        for _class in range(self._known_classes):
+            loop_start_time = time.time()
+            DY = self.cov_computation(Y, class_mean[_class])
+            distance = np.sum((np.tile(Y[None, :, :], [1, 1, 1]) - np.tile(
+                embedding_old[_class, None, :], [1, Y.shape[0], 1])) ** 2, axis=2)
+            W = np.exp(-distance / (2 * sigma ** 2)) + 1e-5
+            W_norm = W / np.tile(np.sum(W, axis=1)[:, None], [1, W.shape[1]])
+            if cov is None:
+                cov = np.sum(np.tile(W_norm[:, :, None, None], [
+                    1, 1, DY.shape[1], DY.shape[2]]) * np.tile(DY[None, :, :, :], [W.shape[0], 1, 1, 1]), axis=1)
+            else:
+                displacement = np.sum(np.tile(W_norm[:, :, None, None], [
+                    1, 1, DY.shape[1], DY.shape[2]]) * np.tile(DY[None, :, :, :], [W.shape[0], 1, 1, 1]), axis=1)
+                cov = np.concatenate((cov, displacement))
+            loop_end_time = time.time()
+            print("single loop time: ", loop_end_time - loop_start_time)
+        end_time = time.time()
+        print("total loop time: ", end_time - start_time)
+
+        cov = torch.tensor(cov)
+        return cov
 
     def displacement(self, Y1, Y2, embedding_old, sigma):
         DY = Y2 - Y1

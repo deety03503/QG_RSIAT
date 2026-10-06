@@ -1,0 +1,15 @@
+{
+  "base_config": "../../exps/adapter_imageneta.json",
+  "experiments": [
+    {"id": "E0_rsiat", "seeds": [1993], "overrides": {"aligner": "rae"}},
+    {"id": "E1_no_orthogonality", "seeds": [1993], "overrides": {"aligner": "qhybrid", "lambda_qrel": 1.0, "gamma": 0.0}},
+    {"id": "E2_qhybrid_cosine", "seeds": [1993], "overrides": {"aligner": "qhybrid", "lambda_qrel": 1.0, "kernel": "cosine"}},
+    {"id": "E3_qhybrid_rbf", "seeds": [1993], "overrides": {"aligner": "qhybrid", "lambda_qrel": 1.0, "kernel": "rbf"}},
+    {"id": "E4_qhybrid", "seeds": [1993], "overrides": {"aligner": "qhybrid"}},
+    {"id": "E5_relational_cosine", "seeds": [1993], "overrides": {"aligner": "qhybrid", "lambda_qrel": 1.0, "kernel": "cosine"}},
+    {"id": "E6_relational_mlp", "seeds": [1993], "overrides": {"aligner": "qhybrid", "lambda_qrel": 1.0, "kernel": "mlp"}},
+    {"id": "E7_qweighted_orth", "seeds": [1993], "overrides": {"aligner": "qhybrid", "lambda_qrel": 1.0, "kernel": "quantum", "orth": "qweighted"}},
+    {"id": "E8_quantum_rs", "seeds": [1993], "overrides": {"aligner": "qhybrid", "lambda_qrel": 1.0, "kernel": "quantum", "orth": "qweighted", "rs_kernel": "quantum"}},
+    {"id": "E9_deeper_circuit", "seeds": [1993], "overrides": {"aligner": "qhybrid", "lambda_qrel": 1.0, "kernel": "quantum", "orth": "qweighted", "quantum_layers": 3}}
+  ]
+}

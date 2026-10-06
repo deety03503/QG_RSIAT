@@ -5,7 +5,6 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from timm.models.layers import DropPath
 import timm
 from functools import partial
@@ -30,6 +29,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
 
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
@@ -39,19 +39,26 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
     def forward(self, x):
         B, N, C = x.shape
 
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        attn_output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
-        )
-        attn_output = attn_output.transpose(1, 2).reshape(B, N, C)
+        q = self.q_proj(x)
+        k = self._shape(self.k_proj(x), -1, B).view(B * self.num_heads, -1, self.head_dim)
+        v = self._shape(self.v_proj(x), -1, B).view(B * self.num_heads, -1, self.head_dim)
+        q = self._shape(q, N, B).view(B * self.num_heads, -1, self.head_dim)
+
+        attn_weights = torch.bmm(q, k.transpose(1, 2)) * self.scale
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        attn_probs = self.attn_drop(attn_weights)
+        attn_output = torch.bmm(attn_probs, v)
+
+        attn_output = attn_output.view(B, self.num_heads, N, self.head_dim)
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(B, N, C)
 
         x = self.proj(attn_output)
         x = self.proj_drop(x)
@@ -296,35 +303,85 @@ class VisionTransformer(nn.Module):
         return x
 
 
-def vit_base_patch16_224_adapter(pretrained=False, **kwargs):
+def _load_adapter_backbone(model, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model"):
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                checkpoint = checkpoint[key]
+                break
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Checkpoint {checkpoint_path} does not contain a state dictionary")
+
+    state_dict = {}
+    for key, value in checkpoint.items():
+        if not isinstance(key, str) or not torch.is_tensor(value):
+            continue
+        normalized = key.removeprefix("module.")
+        state_dict[normalized] = value
+    for key in list(state_dict):
+        if "qkv.weight" in key:
+            qkv = state_dict.pop(key)
+            state_dict[key.replace("qkv.weight", "q_proj.weight")] = qkv[:768]
+            state_dict[key.replace("qkv.weight", "k_proj.weight")] = qkv[768:1536]
+            state_dict[key.replace("qkv.weight", "v_proj.weight")] = qkv[1536:]
+        elif "qkv.bias" in key:
+            qkv = state_dict.pop(key)
+            state_dict[key.replace("qkv.bias", "q_proj.bias")] = qkv[:768]
+            state_dict[key.replace("qkv.bias", "k_proj.bias")] = qkv[768:1536]
+            state_dict[key.replace("qkv.bias", "v_proj.bias")] = qkv[1536:]
+        elif "mlp.fc" in key:
+            state_dict[key.replace("mlp.", "")] = state_dict.pop(key)
+
+    target = model.state_dict()
+    compatible = {
+        key: value for key, value in state_dict.items()
+        if key in target and tuple(value.shape) == tuple(target[key].shape)
+    }
+    target_backbone = sum(
+        value.numel()
+        for key, value in target.items()
+        if not any(token in key for token in ("adapter", "head", "fc_norm"))
+    )
+    loaded_backbone = sum(
+        value.numel()
+        for key, value in compatible.items()
+        if not any(token in key for token in ("adapter", "head", "fc_norm"))
+    )
+    if target_backbone == 0 or loaded_backbone / target_backbone < 0.7:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} only matches "
+            f"{loaded_backbone}/{target_backbone} backbone parameters; "
+            "expected at least 70% compatible pretrained weights."
+        )
+    return model.load_state_dict(compatible, strict=False)
+
+
+def vit_base_patch16_224_adapter(pretrained=False, checkpoint_path=None, **kwargs):
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
                               norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
-    checkpoint_model = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=0)
-    state_dict = checkpoint_model.state_dict()
-    for key in list(state_dict.keys()):
-        if 'qkv.weight' in key:
-            qkv_weight = state_dict.pop(key)
-            q_weight = qkv_weight[:768]
-            k_weight = qkv_weight[768:768 * 2]
-            v_weight = qkv_weight[768 * 2:]
-            state_dict[key.replace('qkv.weight', 'q_proj.weight')] = q_weight
-            state_dict[key.replace('qkv.weight', 'k_proj.weight')] = k_weight
-            state_dict[key.replace('qkv.weight', 'v_proj.weight')] = v_weight
-        elif 'qkv.bias' in key:
-            qkv_bias = state_dict.pop(key)
-            q_bias = qkv_bias[:768]
-            k_bias = qkv_bias[768:768 * 2]
-            v_bias = qkv_bias[768 * 2:]
-            state_dict[key.replace('qkv.bias', 'q_proj.bias')] = q_bias
-            state_dict[key.replace('qkv.bias', 'k_proj.bias')] = k_bias
-            state_dict[key.replace('qkv.bias', 'v_proj.bias')] = v_bias
-    for key in list(state_dict.keys()):
-        if 'mlp.fc' in key:
-            fc_weight = state_dict.pop(key)
-            state_dict[key.replace('mlp.', '')] = fc_weight
-
-    msg = model.load_state_dict(state_dict, strict=False)
+    if checkpoint_path:
+        msg = _load_adapter_backbone(model, checkpoint_path)
+    else:
+        checkpoint_model = timm.create_model(
+            "vit_base_patch16_224", pretrained=pretrained, num_classes=0
+        )
+        state_dict = checkpoint_model.state_dict()
+        for key in list(state_dict.keys()):
+            if 'qkv.weight' in key:
+                qkv_weight = state_dict.pop(key)
+                state_dict[key.replace('qkv.weight', 'q_proj.weight')] = qkv_weight[:768]
+                state_dict[key.replace('qkv.weight', 'k_proj.weight')] = qkv_weight[768:1536]
+                state_dict[key.replace('qkv.weight', 'v_proj.weight')] = qkv_weight[1536:]
+            elif 'qkv.bias' in key:
+                qkv_bias = state_dict.pop(key)
+                state_dict[key.replace('qkv.bias', 'q_proj.bias')] = qkv_bias[:768]
+                state_dict[key.replace('qkv.bias', 'k_proj.bias')] = qkv_bias[768:1536]
+                state_dict[key.replace('qkv.bias', 'v_proj.bias')] = qkv_bias[1536:]
+            elif 'mlp.fc' in key:
+                state_dict[key.replace('mlp.', '')] = state_dict.pop(key)
+        msg = model.load_state_dict(state_dict, strict=False)
 
     for name, p in model.named_parameters():
         if name in msg.missing_keys:
@@ -334,36 +391,31 @@ def vit_base_patch16_224_adapter(pretrained=False, **kwargs):
     return model
 
 
-def vit_base_patch16_224_in21k_adapter(pretrained=False, **kwargs):
+def vit_base_patch16_224_in21k_adapter(pretrained=False, checkpoint_path=None, **kwargs):
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
                               norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
-    checkpoint_model = timm.create_model("vit_base_patch16_224_in21k", pretrained=True, num_classes=0)
-    state_dict = checkpoint_model.state_dict()
-    for key in list(state_dict.keys()):
-        if 'qkv.weight' in key:
-            qkv_weight = state_dict.pop(key)
-            q_weight = qkv_weight[:768]
-            k_weight = qkv_weight[768:768 * 2]
-            v_weight = qkv_weight[768 * 2:]
-            state_dict[key.replace('qkv.weight', 'q_proj.weight')] = q_weight
-            state_dict[key.replace('qkv.weight', 'k_proj.weight')] = k_weight
-            state_dict[key.replace('qkv.weight', 'v_proj.weight')] = v_weight
-        elif 'qkv.bias' in key:
-            qkv_bias = state_dict.pop(key)
-            q_bias = qkv_bias[:768]
-            k_bias = qkv_bias[768:768 * 2]
-            v_bias = qkv_bias[768 * 2:]
-            state_dict[key.replace('qkv.bias', 'q_proj.bias')] = q_bias
-            state_dict[key.replace('qkv.bias', 'k_proj.bias')] = k_bias
-            state_dict[key.replace('qkv.bias', 'v_proj.bias')] = v_bias
-    # second, modify the mlp.fc.weight to match fc.weight
-    for key in list(state_dict.keys()):
-        if 'mlp.fc' in key:
-            fc_weight = state_dict.pop(key)
-            state_dict[key.replace('mlp.', '')] = fc_weight
-
-    msg = model.load_state_dict(state_dict, strict=False)
+    if checkpoint_path:
+        msg = _load_adapter_backbone(model, checkpoint_path)
+    else:
+        checkpoint_model = timm.create_model(
+            "vit_base_patch16_224_in21k", pretrained=pretrained, num_classes=0
+        )
+        state_dict = checkpoint_model.state_dict()
+        for key in list(state_dict.keys()):
+            if 'qkv.weight' in key:
+                qkv_weight = state_dict.pop(key)
+                state_dict[key.replace('qkv.weight', 'q_proj.weight')] = qkv_weight[:768]
+                state_dict[key.replace('qkv.weight', 'k_proj.weight')] = qkv_weight[768:1536]
+                state_dict[key.replace('qkv.weight', 'v_proj.weight')] = qkv_weight[1536:]
+            elif 'qkv.bias' in key:
+                qkv_bias = state_dict.pop(key)
+                state_dict[key.replace('qkv.bias', 'q_proj.bias')] = qkv_bias[:768]
+                state_dict[key.replace('qkv.bias', 'k_proj.bias')] = qkv_bias[768:1536]
+                state_dict[key.replace('qkv.bias', 'v_proj.bias')] = qkv_bias[1536:]
+            elif 'mlp.fc' in key:
+                state_dict[key.replace('mlp.', '')] = state_dict.pop(key)
+        msg = model.load_state_dict(state_dict, strict=False)
 
     for name, p in model.named_parameters():
         if name in msg.missing_keys:

@@ -2,7 +2,7 @@ import copy
 import logging
 import torch
 from torch import nn
-from network.classifier import SimpleContinualLinear
+from network.classifier import  CosineLinear, SimpleContinualLinear
 import timm
 
 
@@ -37,15 +37,28 @@ def get_convnet(args, pretrained=False):
                 vpt_num=0,
             )
             if name == "pretrained_vit_b16_224_adapter":
+                from qrsiat.data.weights import find_pretrained_checkpoint
+                checkpoint_path = find_pretrained_checkpoint(
+                    explicit_path=args.get("pretrained_weights"),
+                    model_tokens=("vit_base_patch16_224",),
+                )
                 model = vision_transformer_adapter.vit_base_patch16_224_adapter(num_classes=0,
                                                                                 global_pool=False, drop_path_rate=0.0,
-                                                                                tuning_config=tuning_config)
+                                                                                tuning_config=tuning_config,
+                                                                                pretrained=checkpoint_path is None,
+                                                                                checkpoint_path=checkpoint_path)
                 model.out_dim = 768
             elif name == "pretrained_vit_b16_224_in21k_adapter":
+                from qrsiat.data.weights import find_pretrained_checkpoint
+                checkpoint_path = find_pretrained_checkpoint(
+                    explicit_path=args.get("pretrained_weights"),
+                )
                 model = vision_transformer_adapter.vit_base_patch16_224_in21k_adapter(num_classes=0,
                                                                                       global_pool=False,
                                                                                       drop_path_rate=0.0,
-                                                                                      tuning_config=tuning_config)
+                                                                                      tuning_config=tuning_config,
+                                                                                      pretrained=checkpoint_path is None,
+                                                                                      checkpoint_path=checkpoint_path)
                 model.out_dim = 768
             else:
                 raise NotImplementedError("Unknown type {}".format(name))
@@ -175,15 +188,29 @@ class SimpleVitNet(BaseNet):
     def extract_vector(self, x):
         return self.convnet(x)
 
-    def forward(self, x, bcb_no_grad=False, fc_only=False, return_features=False):
-        features = self.convnet(x)
-        out = self.fc(features)
-        if return_features:
-            out["features"] = features
+    def forward(self, x, bcb_no_grad=False, fc_only=False):
+        x = self.convnet(x)
+        out = self.fc(x)
+        # out.update(x)
         return out
 
     def ca_forward(self, x):
         fc_out = self.fc(x)
         return fc_out
 
+    def weight_align(self, increment):
+        oldweights = None
+        for i in range(increment):
+            if oldweights is None:
+                oldweights = self.fc.heads[i][0].weight.data
+            else:
+                oldweights = torch.cat((oldweights, self.fc.heads[i][0].weight.data))
+        newweights = self.fc.heads[increment][0].weight.data
+        newnorm = torch.norm(newweights, p=2, dim=1)
+        oldnorm = torch.norm(oldweights, p=2, dim=1)
 
+        meannew = torch.mean(newnorm)
+        meanold = torch.mean(oldnorm)
+        gamma = meanold / meannew
+        print("alignweights,gamma=", gamma)
+        self.fc.heads[increment][0].weight.data[-increment:, :] *= gamma
