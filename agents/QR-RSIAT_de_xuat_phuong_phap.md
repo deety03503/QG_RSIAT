@@ -58,7 +58,7 @@ $$
 
 **(c) Trực giao có trọng số chọn lọc, lấy ý tưởng từ QGTM**
 
-Với feature mới $\hat u_i$ và prototype cũ $\hat p_c$ (đã bù drift kiểu SSIAT rồi ánh xạ qua $P^{t}$, đã centering):
+Với feature mới $\hat u_i$ và prototype cũ $\hat p_c$, prototype cũ được ánh xạ qua $P^{t}$ trước khi tính fidelity. Khi centering bật, feature và prototype trong từng phép so cặp dùng chung tâm. Drift ước lượng ở cuối task không được đưa ngược vào loss của chính task đó; bù drift cần được đánh giá riêng bằng thông tin có sẵn trước hoặc cập nhật online:
 
 $$
 F_{ic} = \left\lvert \langle \psi(\hat u_i) \mid \psi(\hat p_c) \rangle \right\rvert^{2},
@@ -70,7 +70,7 @@ $$
 \mathcal{L}_{\mathrm{orth}}^{q} = \frac{1}{\lvert\mathcal{B}\rvert}\sum_{i\in\mathcal{B}} \sum_{c\in \mathrm{top}\text{-}k_i} \alpha_{ic}\,\max\!\left(0,\; F_{ic} - \varepsilon\right)
 $$
 
-Tức là chỉ phạt các lớp cũ **dễ nhầm nhất** với mẫu hiện tại ($\mathrm{top}\text{-}k_i$ là $k$ lớp cũ có $F_{ic}$ lớn nhất với mẫu $i$), thay vì phạt đều như $\mathcal{L}_{\mathrm{orth}}$ của RSIAT (vốn làm $A_B$ giảm ở Bảng 3). Hinge cho phép "đã đủ trực giao thì thôi", ít hy sinh plasticity hơn.
+Tức là chỉ phạt các lớp cũ **dễ nhầm nhất** với mẫu hiện tại ($\mathrm{top}\text{-}k_i$ là $k$ lớp cũ có $F_{ic}$ lớn nhất với mẫu $i$), thay vì phạt đều như $\mathcal{L}_{\mathrm{orth}}$ của RSIAT (vốn làm $A_B$ giảm ở Bảng 3). Prototype cũ được đưa qua cùng aligner $P^t$; khi centering bật, feature và prototype dùng chung tâm trong từng phép so cặp. Hinge cho phép "đã đủ trực giao thì thôi", ít hy sinh plasticity hơn.
 
 **(d) Classifier:** giữ nguyên SSIAT/RSIAT, tức prototype + covariance → sinh feature Gaussian → huấn luyện lại head.
 
