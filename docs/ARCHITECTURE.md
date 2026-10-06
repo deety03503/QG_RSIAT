@@ -55,9 +55,9 @@ of replacing its transforms or class-order behavior.
 - Quantum modules are constructed only when their related options are enabled.
   Their simulator, fidelity kernels, and qhybrid calculations are explicitly
   run in full precision, outside autocast.
-- The statevector is real-valued: RY/CNOT prepare the state and only Pauli-Z
-  expectation values are read out (one scalar per qubit). No imaginary
-  amplitudes or Pauli-X/Y readout channels are used.
+- The statevector is real-valued: RY/CNOT prepare the state and Pauli-X/Z
+  expectation values are read out (two scalars per qubit). Pauli-Y is omitted
+  because its expectation is zero for real-valued states.
 - Inference and evaluation use the RSIAT network/classifier and do not invoke
   the quantum aligner or kernels.
 - The frozen previous-task network is evaluated under `torch.inference_mode()`.

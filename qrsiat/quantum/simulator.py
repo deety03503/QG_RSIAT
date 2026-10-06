@@ -1,4 +1,4 @@
-"""Batched real-valued RY/CNOT statevector with Pauli-Z readout."""
+"""Batched real-valued RY/CNOT statevector with Pauli-X/Z readout."""
 
 from __future__ import annotations
 
@@ -62,12 +62,17 @@ class RealStatevectorCircuit:
         if state.ndim != 2 or state.shape[1] != 1 << self.n_qubits:
             raise ValueError("state must have shape [B, 2**n_qubits]")
         basis = torch.arange(state.shape[1], device=state.device)
-        outputs = []
+        x_outputs = []
+        z_outputs = []
         for qubit in range(self.n_qubits):
             bit = 1 << qubit
+            paired_basis = basis ^ bit
+            x_value = (state * state.index_select(1, paired_basis)).sum(dim=1)
             z_sign = 1.0 - 2.0 * ((basis & bit) != 0).to(state.dtype)
             z_value = (state.square() * z_sign.unsqueeze(0)).sum(dim=1)
-            outputs.append(z_value)
+            x_outputs.append(x_value)
+            z_outputs.append(z_value)
+        outputs = x_outputs + z_outputs
         return torch.stack(outputs, dim=1).clamp(-1.0, 1.0)
 
 
