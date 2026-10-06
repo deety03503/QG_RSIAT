@@ -443,7 +443,9 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         if task < 0 or task >= len(increments):
             raise ValueError(f"Checkpoint task {task} is outside the current task schedule")
         saved_sizes = metadata.get("task_sizes")
-        if saved_sizes != increments[: task + 1]:
+        # Checkpoints store the complete dataset task schedule, not only the
+        # tasks completed at the time the checkpoint was written.
+        if saved_sizes != increments:
             raise ValueError("Checkpoint task schedule differs from the current dataset split")
         expected_classes = sum(increments[: task + 1])
         if metadata.get("total_classes") != expected_classes:
