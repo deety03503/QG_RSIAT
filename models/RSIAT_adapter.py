@@ -1,5 +1,6 @@
 import copy
 import logging
+import time
 from dataclasses import replace
 from pathlib import Path
 import numpy as np
@@ -620,6 +621,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             optimizer.zero_grad()
             step_count = 0
 
+            training_started = time.perf_counter()
             for i, (_, inputs, targets) in enumerate(train_loader):
                 if self.args.get("smoke", False) and i >= 2:
                     break
@@ -669,6 +671,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 step_count += 1
             if step_count == 0:
                 raise RuntimeError("Training loader yielded no batches")
+            train_speed = total / max(time.perf_counter() - training_started, 1e-9)
             scheduler.step()
 
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
@@ -684,6 +687,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 test_acc,
             )
             prog_bar.set_description(info)
+            prog_bar.set_postfix(speed=f"{train_speed:.1f} samples/s")
         logging.info(info)
 
     def _inc_loss(self, features, features_old):
