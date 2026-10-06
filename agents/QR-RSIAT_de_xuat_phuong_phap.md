@@ -28,10 +28,10 @@ $$
 P^{t}(f) = f + W_{\mathrm{up}}\,\mathrm{Readout}\!\left(\mathrm{PQC}\!\left(W_{\mathrm{down}} f\right)\right), \qquad W_{\mathrm{up}}^{(0)} = 0
 $$
 
-Vì có skip và $W_{\mathrm{up}}=0$ nên $P^{t}=I$ tại thời điểm đầu, giữ được tính chất "không có handbrake" của RSIAT. Readout là kỳ vọng Pauli-$Z/X/Y$ từng qubit (kiểu PQK) để tránh exponential concentration:
+Vì có skip và $W_{\mathrm{up}}=0$ nên $P^{t}=I$ tại thời điểm đầu, giữ được tính chất "không có handbrake" của RSIAT. Mạch statevector thực dùng readout Pauli-$X/Z$ trên từng qubit, thu được $2q$ giá trị; Pauli-$Y$ bị lược vì kỳ vọng bằng 0 với trạng thái thực:
 
 $$
-\mathrm{Readout}(\psi) = \Big[\langle\psi\vert\, \sigma_{a}^{(j)} \,\vert\psi\rangle\Big]_{j=1,\dots,q;\; a\in\{X,Y,Z\}}
+\mathrm{Readout}(\psi) = \Big[\langle X_j\rangle_{j=1}^{q},\;\langle Z_j\rangle_{j=1}^{q}\Big]
 $$
 
 Mạch nông, $l_q \le 2$–$3$, $q \approx 8$–$12$.
