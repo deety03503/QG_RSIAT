@@ -94,6 +94,9 @@ of replacing its transforms or class-order behavior.
 - The qrel student kernel is trainable, while its target is produced by a
   frozen copy snapshotted at the start of each incremental task. This keeps
   the relational target fixed while that task's student kernel is optimized.
+- The qhybrid aligner is reinitialized in full at each incremental task,
+  including its down-projection, circuit angles, and up-projection. Its zero
+  initialized residual up-projection makes the starting map the identity.
 - Class statistics and drift merge sums/counts with all-reduce. Evaluation
   deliberately runs the complete, unpadded test set on each rank; each rank
   reports the same metric and only rank 0 persists artifacts.

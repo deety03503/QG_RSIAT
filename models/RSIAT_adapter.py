@@ -154,9 +154,16 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         if self._cur_task == 1 and self.aligner_mode == "rae":
             self.old_ae = AutoencoderSigmoid(input_dims=768, code_dims=self.args["ae_code_dims"])
             self.old_ae.to(self._device)
-        if self._cur_task > 0 and self.qhybrid is not None:
+        if self._cur_task > 0 and self.aligner_mode == "qhybrid":
+            # Each task aligns against a different frozen previous network, so
+            # start the complete aligner afresh from its identity initialization.
+            self.qhybrid = QHybridAligner(
+                n_qubits=self.args.get("n_qubits", 8),
+                layers=self.args.get("quantum_layers", 2),
+                centering=self.args.get("quantum_centering", True),
+            ).to(self._device)
+        elif self.qhybrid is not None:
             self.qhybrid.to(self._device)
-            torch.nn.init.zeros_(self.qhybrid.up.weight)
         if self.relational_kernel is not None:
             self.relational_kernel.to(self._device)
             if self._cur_task > 0:
