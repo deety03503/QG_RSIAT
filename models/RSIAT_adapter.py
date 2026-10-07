@@ -69,6 +69,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         self.aligner_mode = args.get("aligner", "rae")
         self.qhybrid = None
         self.relational_kernel = None
+        self.relational_kernel_teacher = None
         self.orth_kernel = None
         self.rs_kernel = None
         if self.aligner_mode == "qhybrid":
@@ -158,6 +159,12 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             torch.nn.init.zeros_(self.qhybrid.up.weight)
         if self.relational_kernel is not None:
             self.relational_kernel.to(self._device)
+            if self._cur_task > 0:
+                # Freeze the previous task's kernel as a stable target for this task.
+                self.relational_kernel_teacher = copy.deepcopy(self.relational_kernel)
+                self.relational_kernel_teacher.to(self._device)
+                self.relational_kernel_teacher.requires_grad_(False)
+                self.relational_kernel_teacher.eval()
         if self.orth_kernel is not None:
             self.orth_kernel.to(self._device)
         if self.rs_kernel is not None:
@@ -293,6 +300,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             old_network=old_network,
             aligner=self.qhybrid,
             relational_kernel=self.relational_kernel,
+            relational_kernel_teacher=self.relational_kernel_teacher,
             orth_kernel=self.orth_kernel,
             old_projector=self.old_ae,
             mode=self.aligner_mode,

@@ -26,6 +26,7 @@ class StepModule(nn.Module):
         old_network: nn.Module | None = None,
         aligner: nn.Module | None = None,
         relational_kernel: nn.Module | None = None,
+        relational_kernel_teacher: nn.Module | None = None,
         orth_kernel: nn.Module | None = None,
         old_projector: nn.Module | None = None,
         mode: str = "rae",
@@ -41,6 +42,7 @@ class StepModule(nn.Module):
         self.old_network = old_network
         self.aligner = aligner
         self.relational_kernel = relational_kernel
+        self.relational_kernel_teacher = relational_kernel_teacher
         self.orth_kernel = orth_kernel
         self.old_projector = old_projector
         self.mode = mode
@@ -76,11 +78,16 @@ class StepModule(nn.Module):
         if self.old_network is not None:
             self.old_network.requires_grad_(False)
             self.old_network.eval()
+        if self.relational_kernel_teacher is not None:
+            self.relational_kernel_teacher.requires_grad_(False)
+            self.relational_kernel_teacher.eval()
 
     def train(self, mode: bool = True) -> "StepModule":
         super().train(mode)
         if self.old_network is not None:
             self.old_network.eval()
+        if self.relational_kernel_teacher is not None:
+            self.relational_kernel_teacher.eval()
         return self
 
     def forward(
@@ -166,10 +173,17 @@ class StepModule(nn.Module):
                             raise RuntimeError(
                                 "lambda_qrel is non-zero but no relational kernel is configured"
                             )
+                        if self.relational_kernel_teacher is None:
+                            raise RuntimeError(
+                                "lambda_qrel requires a frozen relational-kernel teacher"
+                            )
                         current_global, _ = self._gather_pairs(features, labels)
                         previous_global, _ = self._gather_pairs(old_features, labels)
                         current_kernel = self.relational_kernel(current_global.float())
-                        previous_kernel = self.relational_kernel(previous_global.float())
+                        with torch.no_grad():
+                            previous_kernel = self.relational_kernel_teacher(
+                                previous_global.float()
+                            )
                         loss_rel = float(beta) * float(lambda_qrel) * (
                             (current_kernel - previous_kernel.detach()).square().mean()
                         )

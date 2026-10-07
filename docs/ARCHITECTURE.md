@@ -91,6 +91,9 @@ of replacing its transforms or class-order behavior.
   that forward graph; the old frozen network is the only external model branch.
 - Pairwise losses gather differentiable features when `pair_gather` is enabled.
   It defaults on for DDP. Without it, pairwise objectives are rank-local.
+- The qrel student kernel is trainable, while its target is produced by a
+  frozen copy snapshotted at the start of each incremental task. This keeps
+  the relational target fixed while that task's student kernel is optimized.
 - Class statistics and drift merge sums/counts with all-reduce. Evaluation
   deliberately runs the complete, unpadded test set on each rank; each rank
   reports the same metric and only rank 0 persists artifacts.
