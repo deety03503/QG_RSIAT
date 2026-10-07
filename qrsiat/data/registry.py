@@ -10,10 +10,10 @@ from qrsiat.hardware.platform_kaggle import kaggle_input_dir
 
 
 DATASET_DIRS = {
-    "imageneta": "imagenet-a",
-    "imagenet-a": "imagenet-a",
-    "imagenetr": "imagenet-r",
-    "imagenet-r": "imagenet-r",
+    "imageneta": "imagenet_a",
+    "imagenet-a": "imagenet_a",
+    "imagenetr": "imagenet_r",
+    "imagenet-r": "imagenet_r",
     "cub": "cub",
     "vtab": "vtab",
     "omnibench": "omnibenchmark",
