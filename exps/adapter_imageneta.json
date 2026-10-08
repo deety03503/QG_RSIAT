@@ -22,8 +22,8 @@
     "ffn_num":64,
     "optimizer":"sgd",
 
-    "scale":30.0,
-    "margin":0.3,
+    "scale":40.0,
+    "margin":0.2,
     "alpha":1.0,
     "rs_margin":0.5,
     "lambda_rs":1.0,
