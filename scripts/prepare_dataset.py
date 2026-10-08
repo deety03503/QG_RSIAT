@@ -9,6 +9,7 @@ train/test assignments when the official metadata is present.
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import shutil
 from collections import defaultdict
@@ -95,10 +96,18 @@ def _prepare_parquet(source: Path, output: Path, test_fraction: float, seed: int
     dataset = load_dataset("parquet", data_files=[str(p) for p in parquet_files], split="train")
     if "image" not in dataset.features or "label" not in dataset.features:
         raise ValueError(f"Expected image and label columns; found {list(dataset.features)}")
+    labels = [int(label) for label in dataset["label"]]
     names = getattr(dataset.features["label"], "names", None)
     if not names:
-        raise ValueError("Parquet labels must include class names (ClassLabel feature)")
-    labels = [int(label) for label in dataset["label"]]
+        names = _class_names_from_metadata(source)
+    if not names:
+        # A numeric class folder preserves the exact label ID and its ordering.
+        # Prefer names from dataset_infos.json whenever the repository provides it.
+        names = [f"class_{index:03d}" for index in range(max(labels, default=-1) + 1)]
+    if labels and (min(labels) < 0 or max(labels) >= len(names)):
+        raise ValueError(
+            f"Label IDs range from {min(labels)} to {max(labels)}, but only {len(names)} class names were found"
+        )
     train_ids, test_ids = _split_indices(labels, test_fraction, seed)
     for split, indices in (("train", train_ids), ("test", test_ids)):
         for index in sorted(indices):
@@ -109,6 +118,34 @@ def _prepare_parquet(source: Path, output: Path, test_fraction: float, seed: int
             destination.parent.mkdir(parents=True, exist_ok=True)
             image.convert("RGB").save(destination, quality=95)
     return True
+
+
+def _class_names_from_metadata(source: Path) -> list[str] | None:
+    """Read Hugging Face ClassLabel names retained in dataset_infos.json."""
+    metadata_path = source / "dataset_infos.json"
+    if not metadata_path.is_file():
+        return None
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    def find_names(value: object) -> list[str] | None:
+        if isinstance(value, dict):
+            label = value.get("label")
+            if isinstance(label, dict) and isinstance(label.get("names"), list):
+                names = label["names"]
+                if all(isinstance(name, str) for name in names):
+                    return names
+            for child in value.values():
+                found = find_names(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = find_names(child)
+                if found:
+                    return found
+        return None
+
+    return find_names(metadata)
 
 
 def _prepare_class_folders(source: Path, output: Path, test_fraction: float, seed: int) -> bool:
