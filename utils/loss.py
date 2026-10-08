@@ -17,6 +17,9 @@ class AngularPenaltySMLoss(nn.Module):
         if loss_type == 'cosface':
             self.s = 20.0 if not s else s
             self.m = 0.0 if not m else m
+        if loss_type == 'crossentropy':
+            # CE is applied to scaled cosine similarities in ``forward``.
+            self.s = 1.0 if not s else s
         self.loss_type = loss_type
         self.eps = eps
 
@@ -24,7 +27,11 @@ class AngularPenaltySMLoss(nn.Module):
 
     def forward(self, wf, labels):
         if self.loss_type == 'crossentropy':
-            return self.cross_entropy(wf, labels)
+            # CosineLinear returns normalized cosine similarities in [-1, 1].
+            # Keep the configured scale for CE as well; without it, the
+            # classifier logits are too small and the softmax gradients are
+            # unnecessarily weak.
+            return self.cross_entropy(self.s * wf, labels)
         else:
             if self.loss_type == 'cosface':
                 numerator = self.s * (torch.diagonal(wf.transpose(0, 1)[labels]) - self.m)

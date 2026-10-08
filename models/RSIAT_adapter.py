@@ -104,8 +104,19 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             self.args["rs_margin"],
             kernel=self.rs_kernel,
         )
+        classification_loss = str(
+            args.get("classification_loss", "cosface")
+        ).lower().replace("_", "")
+        if classification_loss in {"ce", "crossentropy"}:
+            classification_loss = "crossentropy"
+        elif classification_loss != "cosface":
+            raise ValueError(
+                "Unsupported classification_loss={!r}; expected 'cosface' or 'crossentropy'".format(
+                    args.get("classification_loss")
+                )
+            )
         self.loss_cos = AngularPenaltySMLoss(
-            loss_type="cosface",
+            loss_type=classification_loss,
             eps=1e-7,
             s=self.args["scale"],
             m=self.args["margin"],
