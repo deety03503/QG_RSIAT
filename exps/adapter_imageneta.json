@@ -27,7 +27,7 @@
     "margin":0.1,
     "alpha":1.0,
     "rs_margin":0.2,
-    "lambda_rs":1.0,
+    "lambda_rs":0.2,
     "beta":3.0,
     "gamma":6.0,
     "ae_code_dims":128,
