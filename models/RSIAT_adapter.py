@@ -732,8 +732,20 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 train_metric,
                 test_acc,
             )
-            prog_bar.set_description(info)
-            prog_bar.set_postfix(speed=f"{train_speed:.1f} samples/s")
+            prog_bar.set_description(
+                f"Task {self._cur_task}, Epoch {epoch + 1}/{self.tuned_epochs}"
+            )
+            train_postfix = (
+                {"train_eval_accy": f"{train_acc:.2f}"}
+                if self._cur_task == 0
+                else {"train_accy": f"{train_acc:.2f}"}
+            )
+            prog_bar.set_postfix(
+                loss=f"{losses / step_count:.3f}",
+                test_accy=f"{test_acc:.2f}",
+                speed=f"{train_speed:.1f} samples/s",
+                **train_postfix,
+            )
         logging.info(info)
 
     def _inc_loss(self, features, features_old):
