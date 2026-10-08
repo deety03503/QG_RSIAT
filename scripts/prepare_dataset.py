@@ -9,6 +9,7 @@ train/test assignments when the official metadata is present.
 from __future__ import annotations
 
 import argparse
+from io import BytesIO
 import json
 import random
 import shutil
@@ -111,13 +112,38 @@ def _prepare_parquet(source: Path, output: Path, test_fraction: float, seed: int
     train_ids, test_ids = _split_indices(labels, test_fraction, seed)
     for split, indices in (("train", train_ids), ("test", test_ids)):
         for index in sorted(indices):
-            image = dataset[index]["image"]
-            if not hasattr(image, "convert"):
-                raise TypeError(f"Dataset row {index} does not contain a PIL image")
+            image = _decode_image(dataset[index]["image"], index)
             destination = output / split / names[labels[index]] / f"{index:06d}.jpg"
             destination.parent.mkdir(parents=True, exist_ok=True)
             image.convert("RGB").save(destination, quality=95)
     return True
+
+
+def _decode_image(value: object, index: int):
+    """Decode Hugging Face Image values whether returned as PIL or Arrow records."""
+    from PIL import Image
+
+    if isinstance(value, Image.Image):
+        return value
+    if isinstance(value, dict):
+        raw_bytes = value.get("bytes")
+        image_path = value.get("path")
+        if raw_bytes:
+            return Image.open(BytesIO(raw_bytes))
+        if image_path:
+            path = Path(image_path)
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            if path.is_file():
+                return Image.open(path)
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        return Image.open(BytesIO(bytes(value)))
+    elif isinstance(value, (str, Path)):
+        return Image.open(value)
+    raise TypeError(
+        f"Dataset row {index} image has unsupported value type {type(value).__name__}; "
+        "expected a PIL image or a record with image bytes/path"
+    )
 
 
 def _class_names_from_metadata(source: Path) -> list[str] | None:
