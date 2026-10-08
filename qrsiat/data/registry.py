@@ -10,10 +10,10 @@ from qrsiat.hardware.platform_kaggle import kaggle_input_dir
 
 
 DATASET_DIRS = {
-    "imageneta": "imagenet_a",
-    "imagenet-a": "imagenet_a",
-    "imagenetr": "imagenet_r",
-    "imagenet-r": "imagenet_r",
+    "imageneta": "imagenet-a",
+    "imagenet-a": "imagenet-a",
+    "imagenetr": "imagenet-r",
+    "imagenet-r": "imagenet-r",
     "cub": "cub",
     "vtab": "vtab",
     "omnibench": "omnibenchmark",
@@ -97,13 +97,15 @@ def discover_dataset(
     candidates: list[Path] = []
     if data_root:
         base = Path(data_root).expanduser()
-        candidates.extend((base / canonical, base / name, base))
+        candidates.extend((base / canonical, base / canonical.replace("-", "_"), base / name, base))
     repo = Path(repository_root).expanduser()
     candidates.extend(
         (
             repo / "data" / "datasets" / canonical,
+            repo / "data" / "datasets" / canonical.replace("-", "_"),
             repo / "data" / "datasets" / name,
             repo / "datasets" / canonical,
+            repo / "datasets" / canonical.replace("-", "_"),
             repo / "datasets" / name,
         )
     )
@@ -114,7 +116,7 @@ def discover_dataset(
             if not dataset_mount.is_dir():
                 continue
             if safe_name.fullmatch(dataset_mount.name.replace("_", "-")):
-                candidates.extend((dataset_mount / canonical, dataset_mount / name, dataset_mount))
+                candidates.extend((dataset_mount / canonical, dataset_mount / canonical.replace("-", "_"), dataset_mount / name, dataset_mount))
             candidates.extend(
                 child for child in dataset_mount.iterdir()
                 if child.is_dir() and safe_name.fullmatch(child.name.replace("_", "-"))

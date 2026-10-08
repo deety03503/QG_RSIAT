@@ -178,6 +178,12 @@ def main() -> None:
                     repository_root=".",
                 )
                 preparation["root"] = str(location.root)
+                if location.is_cifar:
+                    prepared_cifar = Path(data_root or "./data/datasets") / "cifar224"
+                    if (prepared_cifar / "train").is_dir() and (prepared_cifar / "test").is_dir():
+                        os.environ["RSIAT_DATASET_ROOT"] = str(prepared_cifar.resolve())
+                else:
+                    os.environ["RSIAT_DATASET_ROOT"] = str(location.root)
             except Exception:
                 preparation["error"] = traceback.format_exc()
         if context.world_size > 1:

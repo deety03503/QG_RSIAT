@@ -1,23 +1,42 @@
 """Prepare CUB, ImageNet-A, or ImageNet-R as train/<class>/ and test/<class>/.
 
-ImageNet-A and ImageNet-R are evaluation datasets, not training datasets. When
-their source has no predefined split, this utility makes a reproducible,
-stratified split for experiments and smoke tests. CUB uses its published
-train/test assignments when the official metadata is present.
+Datasets with a published train/test split keep that split. When a source has
+only one split (for example ImageNet-R), this utility makes a reproducible,
+stratified split for experiments and smoke tests.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 from io import BytesIO
 import json
 import random
 import shutil
+import tarfile
+import tempfile
+import urllib.request
+from urllib.parse import urlparse
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-EXPECTED_CLASSES = {"cub": 200, "imageneta": 200, "imagenetr": 200}
+EXPECTED_CLASSES = {
+    "cub": 200, "imageneta": 200, "imagenetr": 200,
+    "vtab": 50, "omnibench": 300, "omnibenchmark": 300,
+    "cifar100": 100, "cifar224": 100,
+}
+DATASET_DIRS = {
+    "cub": "cub", "imageneta": "imagenet-a", "imagenetr": "imagenet-r",
+    "vtab": "vtab", "omnibench": "omnibenchmark", "omnibenchmark": "omnibenchmark",
+    "cifar100": "cifar224", "cifar224": "cifar224",
+}
+RAW_NAMES = {
+    "cub": "cub", "imageneta": "imagenet_a", "imagenetr": "imagenet_r",
+    "vtab": "vtab", "omnibench": "omnibenchmark", "omnibenchmark": "omnibenchmark",
+    "cifar100": "cifar100", "cifar224": "cifar100",
+}
 
 
 def _split_indices(labels: list[int], test_fraction: float, seed: int) -> tuple[set[int], set[int]]:
@@ -54,6 +73,85 @@ def _class_directories(root: Path) -> dict[str, list[Path]]:
     return best
 
 
+def _copy_imagefolder(source: Path, output: Path) -> bool:
+    """Copy an already split ImageFolder without silently re-splitting it."""
+    train, test = source / "train", source / "test"
+    if not (train.is_dir() and test.is_dir()):
+        return False
+    train_classes = {p.name for p in train.iterdir() if p.is_dir()}
+    test_classes = {p.name for p in test.iterdir() if p.is_dir()}
+    if not train_classes or train_classes != test_classes:
+        raise ValueError("Source train/test directories must contain the same non-empty class set")
+    for split in ("train", "test"):
+        for image in (source / split).rglob("*"):
+            if image.is_file() and image.suffix.lower() in IMAGE_SUFFIXES:
+                relative = image.relative_to(source / split)
+                destination = output / split / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(image, destination)
+    return True
+
+
+def _safe_extract(archive: Path, destination: Path) -> None:
+    """Extract zip/tar archives while rejecting path traversal entries."""
+    destination = destination.resolve()
+    with zipfile.ZipFile(archive) if zipfile.is_zipfile(archive) else tarfile.open(archive) as handle:
+        members = handle.infolist() if isinstance(handle, zipfile.ZipFile) else handle.getmembers()
+        for member in members:
+            name = member.filename
+            if isinstance(handle, zipfile.ZipFile):
+                is_directory = name.endswith("/")
+                is_symlink = (member.external_attr >> 16) & 0o170000 == 0o120000
+            else:
+                is_directory = member.isdir()
+                is_symlink = member.issym() or member.islnk()
+            unsupported_tar_member = not isinstance(handle, zipfile.ZipFile) and not (member.isdir() or member.isreg())
+            if is_symlink or unsupported_tar_member:
+                raise ValueError(f"Archive contains unsupported link or special file: {name}")
+            target = (destination / name).resolve()
+            if target != destination and destination not in target.parents:
+                raise ValueError(f"Archive contains unsafe path: {name}")
+        handle.extractall(destination)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _resolve_source(source: Path | None, url: str | None, cache: Path | None, checksum: str | None):
+    """Resolve a directory or download/extract one archive into a temporary tree."""
+    if source is not None and source.exists() and source.is_dir():
+        return source, None
+    if source is not None and not source.is_file() and url is None:
+        raise FileNotFoundError(f"Dataset source not found: {source}")
+    if source is not None and source.is_file():
+        if checksum and _sha256(source).lower() != checksum.lower():
+            raise ValueError(f"SHA256 mismatch for {source}")
+        temporary_dir = Path(tempfile.mkdtemp(prefix="prepared-dataset-"))
+        _safe_extract(source, temporary_dir)
+        return temporary_dir, temporary_dir
+    if url is None:
+        raise FileNotFoundError("Provide an existing --source directory/archive or --url")
+    cache = cache or Path(".dataset-cache")
+    cache.mkdir(parents=True, exist_ok=True)
+    archive = cache / Path(urlparse(url).path).name
+    if not archive.name or archive.name == ".":
+        archive = cache / "dataset.download"
+    if not archive.exists():
+        temporary = archive.with_suffix(archive.suffix + ".part")
+        urllib.request.urlretrieve(url, temporary)
+        temporary.replace(archive)
+    if checksum and _sha256(archive).lower() != checksum.lower():
+        raise ValueError(f"SHA256 mismatch for {archive}")
+    temporary_dir = Path(tempfile.mkdtemp(prefix="prepared-dataset-"))
+    _safe_extract(archive, temporary_dir)
+    return temporary_dir, temporary_dir
+
+
 def _prepare_cub_official(source: Path, output: Path) -> bool:
     """Use CUB_200_2011's published train_test_split.txt if present."""
     roots = [source, *sorted(p for p in source.rglob("CUB_200_2011") if p.is_dir())]
@@ -86,7 +184,7 @@ def _prepare_cub_official(source: Path, output: Path) -> bool:
 
 
 def _prepare_parquet(source: Path, output: Path, test_fraction: float, seed: int) -> bool:
-    parquet_files = sorted((source / "data").glob("*.parquet"))
+    parquet_files = sorted(source.rglob("*.parquet"))
     if not parquet_files:
         return False
     try:
@@ -94,26 +192,43 @@ def _prepare_parquet(source: Path, output: Path, test_fraction: float, seed: int
     except ImportError as exc:
         raise RuntimeError("Parquet sources require `pip install datasets`.") from exc
 
-    dataset = load_dataset("parquet", data_files=[str(p) for p in parquet_files], split="train")
-    if "image" not in dataset.features or "label" not in dataset.features:
-        raise ValueError(f"Expected image and label columns; found {list(dataset.features)}")
-    labels = [int(label) for label in dataset["label"]]
-    names = getattr(dataset.features["label"], "names", None)
+    split_files: dict[str, list[Path]] = defaultdict(list)
+    for path in parquet_files:
+        parent_names = {part.lower() for part in path.relative_to(source).parts[:-1]}
+        split_files["test" if "test" in parent_names else "train"].append(path)
+
+    datasets_by_split = {
+        split: load_dataset("parquet", data_files=[str(p) for p in files], split="train")
+        for split, files in split_files.items()
+    }
+    first_dataset = next(iter(datasets_by_split.values()))
+    if "image" not in first_dataset.features or "label" not in first_dataset.features:
+        raise ValueError(f"Expected image and label columns; found {list(first_dataset.features)}")
+    names = getattr(first_dataset.features["label"], "names", None)
     if not names:
         names = _class_names_from_metadata(source)
     if not names:
         # A numeric class folder preserves the exact label ID and its ordering.
         # Prefer names from dataset_infos.json whenever the repository provides it.
         names = [f"class_{index:03d}" for index in range(max(labels, default=-1) + 1)]
-    if labels and (min(labels) < 0 or max(labels) >= len(names)):
+    all_labels = [int(label) for dataset in datasets_by_split.values() for label in dataset["label"]]
+    if all_labels and (min(all_labels) < 0 or max(all_labels) >= len(names)):
         raise ValueError(
-            f"Label IDs range from {min(labels)} to {max(labels)}, but only {len(names)} class names were found"
+            f"Label IDs range from {min(all_labels)} to {max(all_labels)}, but only {len(names)} class names were found"
         )
-    train_ids, test_ids = _split_indices(labels, test_fraction, seed)
-    for split, indices in (("train", train_ids), ("test", test_ids)):
-        for index in sorted(indices):
+
+    if set(datasets_by_split) == {"train", "test"}:
+        selected = [(split, dataset, range(len(dataset))) for split, dataset in datasets_by_split.items()]
+    else:
+        dataset = first_dataset
+        labels = [int(label) for label in dataset["label"]]
+        train_ids, test_ids = _split_indices(labels, test_fraction, seed)
+        selected = [("train", dataset, sorted(train_ids)), ("test", dataset, sorted(test_ids))]
+    for split, dataset, indices in selected:
+        for index in indices:
+            label = int(dataset[index]["label"])
             image = _decode_image(dataset[index]["image"], index)
-            destination = output / split / names[labels[index]] / f"{index:06d}.jpg"
+            destination = output / split / names[label] / f"{index:06d}.jpg"
             destination.parent.mkdir(parents=True, exist_ok=True)
             image.convert("RGB").save(destination, quality=95)
     return True
@@ -194,9 +309,12 @@ def _prepare_class_folders(source: Path, output: Path, test_fraction: float, see
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", required=True, choices=sorted(EXPECTED_CLASSES))
-    parser.add_argument("--source", required=True, help="Downloaded archive, extracted folders, or HF repository")
-    parser.add_argument("--output", required=True, help="Prepared dataset directory")
+    parser.add_argument("--dataset", default="imageneta", choices=sorted(EXPECTED_CLASSES))
+    parser.add_argument("--source", help="Downloaded archive, extracted folders, or HF repository")
+    parser.add_argument("--url", help="URL of an archive to download when --source is absent")
+    parser.add_argument("--cache", help="Archive cache directory used with --url")
+    parser.add_argument("--sha256", help="Expected SHA256 for --source/--url archive")
+    parser.add_argument("--output", help="Prepared dataset directory (default: data/datasets/<dataset>)")
     parser.add_argument("--test_fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=1993)
     parser.add_argument("--overwrite", action="store_true")
@@ -204,28 +322,44 @@ def main() -> None:
     if not 0 < args.test_fraction < 1:
         parser.error("--test_fraction must be between 0 and 1")
 
-    source = Path(args.source).expanduser().resolve()
-    output = Path(args.output).expanduser().resolve()
-    if not source.is_dir():
-        raise FileNotFoundError(f"Dataset source directory not found: {source}")
+    source_arg = Path(args.source).expanduser().resolve() if args.source else None
+    if source_arg is None:
+        source_candidates = [
+            Path("/kaggle/working/hf-datasets/raw") / RAW_NAMES[args.dataset],
+            Path("data/raw") / RAW_NAMES[args.dataset],
+            Path("data/raw") / args.dataset,
+        ]
+        source_arg = next((candidate.resolve() for candidate in source_candidates if candidate.exists()), None)
+        if source_arg is None and args.url is None:
+            searched = ", ".join(str(path) for path in source_candidates)
+            raise FileNotFoundError(
+                f"Could not infer dataset source. Searched: {searched}. "
+                "Pass --source or download the Hugging Face snapshot first."
+            )
+    output = Path(args.output or (Path("data/datasets") / DATASET_DIRS[args.dataset])).expanduser().resolve()
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"Output already exists: {output}; pass --overwrite to replace it")
     if output.exists():
         shutil.rmtree(output)
     output.mkdir(parents=True)
-
-    prepared = False
-    if args.dataset == "cub":
-        prepared = _prepare_cub_official(source, output)
-    if not prepared:
-        prepared = _prepare_parquet(source, output, args.test_fraction, args.seed)
-    if not prepared:
-        prepared = _prepare_class_folders(source, output, args.test_fraction, args.seed)
-    if not prepared:
-        output.rmdir()
-        raise FileNotFoundError(
-            f"Could not find CUB metadata, Parquet files, or class folders under {source}"
-        )
+    source, temporary_source = _resolve_source(
+        source_arg, args.url, Path(args.cache).expanduser().resolve() if args.cache else None, args.sha256
+    )
+    try:
+        prepared = _copy_imagefolder(source, output)
+        if not prepared and args.dataset == "cub":
+            prepared = _prepare_cub_official(source, output)
+        if not prepared:
+            prepared = _prepare_parquet(source, output, args.test_fraction, args.seed)
+        if not prepared:
+            prepared = _prepare_class_folders(source, output, args.test_fraction, args.seed)
+        if not prepared:
+            raise FileNotFoundError(
+                f"Could not find CUB metadata, Parquet files, or class folders under {source}"
+            )
+    finally:
+        if temporary_source is not None:
+            shutil.rmtree(temporary_source, ignore_errors=True)
 
     train_classes = {p.name for p in (output / "train").iterdir() if p.is_dir()}
     test_classes = {p.name for p in (output / "test").iterdir() if p.is_dir()}
