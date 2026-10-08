@@ -222,6 +222,28 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             if plan is not None
             else DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=8)
         )
+        self.train_eval_loader = None
+        if self._cur_task == 0:
+            train_eval_dataset = data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="train",
+                mode="test",
+            )
+            self.train_eval_loader = (
+                create_data_loader(
+                    train_eval_dataset,
+                    plan,
+                    training=False,
+                    batch_size=self.batch_size,
+                )
+                if plan is not None
+                else DataLoader(
+                    train_eval_dataset,
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                    num_workers=8,
+                )
+            )
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = (
             create_data_loader(
@@ -300,16 +322,17 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 self._stage2_compact_classifier(task_size, self.args['ca_epochs'])
 
     def _build_step_module(self):
-        old_network = self.old_network_module_ptr if self._cur_task > 0 else None
+        incremental = self._cur_task > 0
+        old_network = self.old_network_module_ptr if incremental else None
         self._training_module = self.build_step_module(
             self._network,
             rs_loss=self.rs_loss_func if self._cur_task == 0 else None,
             old_network=old_network,
-            aligner=self.qhybrid,
-            relational_kernel=self.relational_kernel,
-            relational_kernel_teacher=self.relational_kernel_teacher,
-            orth_kernel=self.orth_kernel,
-            old_projector=self.old_ae,
+            aligner=self.qhybrid if incremental else None,
+            relational_kernel=self.relational_kernel if incremental else None,
+            relational_kernel_teacher=self.relational_kernel_teacher if incremental else None,
+            orth_kernel=self.orth_kernel if incremental else None,
+            old_projector=self.old_ae if incremental else None,
             mode=self.aligner_mode,
             device=self._device,
             runtime_context=self.args.get("runtime_context"),
@@ -534,11 +557,11 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             if self.args.get("smoke", False):
                 self.tuned_epochs = max(1, min(2, self.tuned_epochs))
             param_groups = [
-                {'params': self._network.convnet.blocks[-1].parameters(), 'lr': 0.01 * lr_scale,
+                {'params': self._network.convnet.blocks[-1].parameters(), 'lr': self.init_lr * lr_scale,
                  'weight_decay': self.args['weight_decay']},
-                {'params': self._network.convnet.blocks[:-1].parameters(), 'lr': 0.01 * lr_scale,
+                {'params': self._network.convnet.blocks[:-1].parameters(), 'lr': self.init_lr * lr_scale,
                  'weight_decay': self.args['weight_decay']},
-                {'params': self._network.fc.parameters(), 'lr': 0.01 * lr_scale, 'weight_decay': self.args['weight_decay']}
+                {'params': self._network.fc.parameters(), 'lr': self.init_lr * lr_scale, 'weight_decay': self.args['weight_decay']}
             ]
             self._append_step_parameters(param_groups, lr_scale=lr_scale)
 
@@ -682,8 +705,9 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 losses += loss.item()
                 losses_c += loss_c.item()
                 losses_rt += loss_rt.item()
-                _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                if self._cur_task > 0:
+                    _, preds = torch.max(logits, dim=1)
+                    correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 step_count += 1
             if step_count == 0:
@@ -691,16 +715,21 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             train_speed = total / max(time.perf_counter() - training_started, 1e-9)
             scheduler.step()
 
-            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+            if self._cur_task == 0:
+                train_acc = self._compute_accuracy(self._network, self.train_eval_loader)
+                train_metric = "Train_eval_accy {:.2f}".format(train_acc)
+            else:
+                train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+                train_metric = "Train_accy {:.2f}".format(train_acc)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, {}, Test_accy {:.2f}".format(
                 self._cur_task,
                 epoch + 1,
                 self.tuned_epochs,
                 losses / step_count,
                 losses_c/step_count,
                 losses_rt/step_count,
-                train_acc,
+                train_metric,
                 test_acc,
             )
             prog_bar.set_description(info)

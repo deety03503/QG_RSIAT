@@ -16,13 +16,16 @@ def build_transform(is_train, args):
     input_size = 224
     resize_im = input_size > 32
     if is_train:
-        scale = (0.05, 1.0)
+        scale = (0.08, 1.0)
         ratio = (3. / 4., 4. / 3.)
         
         transform = [
             transforms.RandomResizedCrop(input_size, scale=scale, ratio=ratio),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
+            # The configured ViT-B/16 IN21K checkpoint expects inputs scaled
+            # from [0, 1] to [-1, 1] (mean/std = 0.5 per channel).
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         ]
         return transform
 
@@ -34,6 +37,7 @@ def build_transform(is_train, args):
         )
         t.append(transforms.CenterCrop(input_size))
     t.append(transforms.ToTensor())
+    t.append(transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)))
     
     # return transforms.Compose(t)
     return t
