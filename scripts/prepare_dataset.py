@@ -202,33 +202,54 @@ def _prepare_parquet(source: Path, output: Path, test_fraction: float, seed: int
         for split, files in split_files.items()
     }
     first_dataset = next(iter(datasets_by_split.values()))
-    if "image" not in first_dataset.features or "label" not in first_dataset.features:
-        raise ValueError(f"Expected image and label columns; found {list(first_dataset.features)}")
-    names = getattr(first_dataset.features["label"], "names", None)
-    if not names:
-        names = _class_names_from_metadata(source)
-    if not names:
-        # A numeric class folder preserves the exact label ID and its ordering.
-        # Prefer names from dataset_infos.json whenever the repository provides it.
-        names = [f"class_{index:03d}" for index in range(max(labels, default=-1) + 1)]
-    all_labels = [int(label) for dataset in datasets_by_split.values() for label in dataset["label"]]
-    if all_labels and (min(all_labels) < 0 or max(all_labels) >= len(names)):
+    if "image" not in first_dataset.features:
+        raise ValueError(f"Expected an image column; found {list(first_dataset.features)}")
+    label_column = next(
+        (column for column in ("label", "class_name", "class", "wnid") if column in first_dataset.features),
+        None,
+    )
+    if label_column is None:
         raise ValueError(
-            f"Label IDs range from {min(all_labels)} to {max(all_labels)}, but only {len(names)} class names were found"
+            f"Expected a label, class_name, class, or wnid column; found {list(first_dataset.features)}"
         )
+
+    all_labels = [label for dataset in datasets_by_split.values() for label in dataset[label_column]]
+    feature_names = getattr(first_dataset.features[label_column], "names", None)
+    metadata_names = _class_names_from_metadata(source) if label_column == "label" else None
+    if all(isinstance(label, str) for label in all_labels):
+        # ImageNet parquet exports commonly store the class directory/wnid as text.
+        # Use those values directly, in stable order, instead of treating them as IDs.
+        names = sorted(set(all_labels))
+        label_to_name = {name: name for name in names}
+    else:
+        try:
+            numeric_labels = [int(label) for label in all_labels]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Column {label_column!r} must contain all strings or numeric class IDs") from exc
+        names = feature_names or metadata_names
+        if not names:
+            # Preserve numeric IDs with stable generated class folder names.
+            names = [f"class_{index:03d}" for index in range(max(numeric_labels, default=-1) + 1)]
+        if numeric_labels and (min(numeric_labels) < 0 or max(numeric_labels) >= len(names)):
+            raise ValueError(
+                f"Label IDs range from {min(numeric_labels)} to {max(numeric_labels)}, "
+                f"but only {len(names)} class names were found"
+            )
+        label_to_name = {index: name for index, name in enumerate(names)}
 
     if set(datasets_by_split) == {"train", "test"}:
         selected = [(split, dataset, range(len(dataset))) for split, dataset in datasets_by_split.items()]
     else:
         dataset = first_dataset
-        labels = [int(label) for label in dataset["label"]]
-        train_ids, test_ids = _split_indices(labels, test_fraction, seed)
+        labels = dataset[label_column]
+        split_labels = [names.index(label) if isinstance(label, str) else int(label) for label in labels]
+        train_ids, test_ids = _split_indices(split_labels, test_fraction, seed)
         selected = [("train", dataset, sorted(train_ids)), ("test", dataset, sorted(test_ids))]
     for split, dataset, indices in selected:
         for index in indices:
-            label = int(dataset[index]["label"])
+            label = dataset[index][label_column]
             image = _decode_image(dataset[index]["image"], index)
-            destination = output / split / names[label] / f"{index:06d}.jpg"
+            destination = output / split / label_to_name[label] / f"{index:06d}.jpg"
             destination.parent.mkdir(parents=True, exist_ok=True)
             image.convert("RGB").save(destination, quality=95)
     return True
