@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from .simulator import RealStatevectorCircuit
-from .centering import EMACenter
 
 
 class QuantumFeatureMap(nn.Module):
@@ -26,7 +25,6 @@ class QuantumFeatureMap(nn.Module):
         self.project = nn.Linear(input_dim, n_qubits * layers)
         self.simulator = RealStatevectorCircuit(n_qubits, layers)
         self.centering = centering
-        self.center_ema = EMACenter(input_dim)
         self.n_qubits = n_qubits
         self.layers = layers
         self.theta = nn.Parameter(torch.zeros(layers, n_qubits))
@@ -46,10 +44,8 @@ class QuantumFeatureMap(nn.Module):
         values = features.float()
         if self.centering:
             if centering_mean is None:
-                if self.training:
-                    centering_mean = self.center_ema.update(values)
-                else:
-                    centering_mean = self.center_ema.current(values)
+                if values.shape[0] > 1:
+                    centering_mean = values.mean(dim=0, keepdim=True)
             else:
                 if centering_mean.ndim == 1:
                     centering_mean = centering_mean.unsqueeze(0)
