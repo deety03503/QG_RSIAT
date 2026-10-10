@@ -59,18 +59,8 @@ class PairwiseKernel(nn.Module):
                 states, _ = self.quantum(features)
                 right_states = states
             else:
-                centering_mean = None
-                if self.quantum.centering:
-                    centering_mean = (
-                        features.float().mean(dim=0, keepdim=True)
-                        + right.float().mean(dim=0, keepdim=True)
-                    ) / 2.0
-                states, _ = self.quantum(
-                    features, centering_mean=centering_mean
-                )
-                right_states = self.quantum(
-                    right, centering_mean=centering_mean
-                )[0]
+                states, _ = self.quantum(features)
+                right_states = self.quantum(right)[0]
             return fidelity_kernel(states, right_states)
         if self.projector is not None:
             features = self.projector(features)

@@ -30,12 +30,12 @@ class QuantumFeatureMap(nn.Module):
         self.theta = nn.Parameter(torch.zeros(layers, n_qubits))
 
     def __call__(
-        self, features: Any, *, centering_mean: Any | None = None
+        self, features: Any
     ) -> tuple[Any, Any]:
-        return super().__call__(features, centering_mean=centering_mean)
+        return super().__call__(features)
 
     def forward(
-        self, features: Any, *, centering_mean: Any | None = None
+        self, features: Any
     ) -> tuple[Any, Any]:
         if features.ndim != 2 or features.shape[1] != self.project.in_features:
             raise ValueError(
@@ -43,20 +43,7 @@ class QuantumFeatureMap(nn.Module):
             )
         values = features.float()
         if self.centering:
-            if centering_mean is None:
-                if values.shape[0] > 1:
-                    centering_mean = values.mean(dim=0, keepdim=True)
-            else:
-                if centering_mean.ndim == 1:
-                    centering_mean = centering_mean.unsqueeze(0)
-                if tuple(centering_mean.shape) != (1, self.project.in_features):
-                    raise ValueError(
-                        f"centering_mean must have shape [{self.project.in_features}] "
-                        f"or [1,{self.project.in_features}]"
-                    )
-                centering_mean = centering_mean.to(values)
-            if centering_mean is not None:
-                values = values - centering_mean
+            values = torch.nn.functional.normalize(values, p=2, dim=1)
         angles = self.project(values).reshape(-1, self.layers, self.n_qubits)
         angles = angles.tanh() * 3.141592653589793
         state = self.simulator(angles, self.theta)
