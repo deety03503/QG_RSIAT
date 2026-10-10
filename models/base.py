@@ -46,6 +46,34 @@ class BaseLearner(object):
     def feature_dim(self):
         return self._network.feature_dim
 
+    @staticmethod
+    def _make_sampling_covariance(covariance):
+        """Return a symmetric positive-definite covariance for Gaussian sampling.
+
+        The covariance is formed from sufficient statistics, so cancellation in
+        ``E[xx^T] - mu mu^T`` can leave tiny negative eigenvalues in high
+        dimensions.  ``MultivariateNormal`` rejects those matrices even when
+        they are numerically indistinguishable from PSD.
+        """
+        cov = covariance.to(dtype=torch.float64)
+        cov = 0.5 * (cov + cov.transpose(-1, -2))
+        if not torch.isfinite(cov).all():
+            raise ValueError("Class covariance contains NaN or infinite values")
+
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+        mean_variance = torch.diagonal(cov).mean().abs()
+        floor = torch.maximum(
+            torch.as_tensor(1e-3, dtype=cov.dtype, device=cov.device),
+            mean_variance * 1e-4,
+        )
+        eigenvalues = eigenvalues.clamp_min(floor)
+        cov = (eigenvectors * eigenvalues.unsqueeze(0)) @ eigenvectors.transpose(-1, -2)
+
+        # Keep a small margin after the float64 -> float32 conversion below.
+        cov = cov.to(dtype=torch.float32)
+        eye = torch.eye(cov.shape[-1], dtype=cov.dtype, device=cov.device)
+        return 0.5 * (cov + cov.transpose(-1, -2)) + floor.to(cov.dtype) * eye
+
 
     def _stage2_compact_classifier(self, task_size, ca_epochs=5):
         context = getattr(self, "args", {}).get("runtime_context")
@@ -93,7 +121,8 @@ class BaseLearner(object):
                             0.9 + decay)
 
                 cls_cov = self._class_covs[c_id].to(self._device)
-                m = MultivariateNormal(cls_mean.float(), cls_cov.float())
+                cls_cov = self._make_sampling_covariance(cls_cov)
+                m = MultivariateNormal(cls_mean.float(), cls_cov)
                 sampled_data_single = m.sample(sample_shape=(num_sampled_pcls,))
                 sampled_data.append(sampled_data_single)
                 sampled_label.extend([c_id] * num_sampled_pcls)

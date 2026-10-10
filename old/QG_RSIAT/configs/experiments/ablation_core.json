@@ -1,0 +1,55 @@
+{
+  "base_config": "../../exps/adapter_imageneta.json",
+  "experiments": [
+    {
+      "id": "E0_rsiat",
+      "seeds": [1993],
+      "overrides": {
+        "aligner": "rae",
+        "lambda_qrel": 0.0,
+        "orth": "plain",
+        "rs_kernel": "cosine"
+      }
+    },
+    {
+      "id": "E4_qhybrid",
+      "seeds": [1993],
+      "overrides": {
+        "aligner": "qhybrid",
+        "lambda_qrel": 0.0,
+        "orth": "plain"
+      }
+    },
+    {
+      "id": "E5_relational_cosine",
+      "seeds": [1993],
+      "overrides": {
+        "aligner": "qhybrid",
+        "lambda_qrel": 1.0,
+        "kernel": "cosine",
+        "orth": "plain"
+      }
+    },
+    {
+      "id": "E7_qweighted_orth",
+      "seeds": [1993],
+      "overrides": {
+        "aligner": "qhybrid",
+        "lambda_qrel": 1.0,
+        "kernel": "quantum",
+        "orth": "qweighted"
+      }
+    },
+    {
+      "id": "E8_quantum_rs",
+      "seeds": [1993],
+      "overrides": {
+        "aligner": "qhybrid",
+        "lambda_qrel": 1.0,
+        "kernel": "quantum",
+        "orth": "qweighted",
+        "rs_kernel": "quantum"
+      }
+    }
+  ]
+}

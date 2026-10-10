@@ -16,13 +16,16 @@ def build_transform(is_train, args):
     input_size = 224
     resize_im = input_size > 32
     if is_train:
-        scale = (0.05, 1.0)
+        scale = (0.08, 1.0)
         ratio = (3. / 4., 4. / 3.)
         
         transform = [
             transforms.RandomResizedCrop(input_size, scale=scale, ratio=ratio),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
+            # The configured ViT-B/16 IN21K checkpoint expects inputs scaled
+            # from [0, 1] to [-1, 1] (mean/std = 0.5 per channel).
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         ]
         return transform
 
@@ -34,6 +37,7 @@ def build_transform(is_train, args):
         )
         t.append(transforms.CenterCrop(input_size))
     t.append(transforms.ToTensor())
+    t.append(transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)))
     
     # return transforms.Compose(t)
     return t
@@ -51,6 +55,14 @@ class iCIFAR224(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
+        prepared_root = os.environ.get("RSIAT_DATASET_ROOT")
+        if prepared_root and os.path.isdir(os.path.join(prepared_root, "train")):
+            train_dataset = datasets.ImageFolder(os.path.join(prepared_root, "train"))
+            test_dataset = datasets.ImageFolder(os.path.join(prepared_root, "test"))
+            self.train_data, self.train_targets = split_images_labels(train_dataset.imgs)
+            self.test_data, self.test_targets = split_images_labels(test_dataset.imgs)
+            self.use_path = True
+            return
         root = os.environ.get("RSIAT_CIFAR_ROOT", "./data/datasets")
         train_dataset = datasets.cifar.CIFAR100(root, train=True, download=True)
         test_dataset = datasets.cifar.CIFAR100(root, train=False, download=True)
@@ -75,9 +87,7 @@ class iImageNetR(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/datasets/imagenet-r/train/"
-        test_dir = "./data/datasets/imagenet-r/test/"
+        train_dir, test_dir = _imagefolder_paths("imagenet-r")
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -96,9 +106,7 @@ class iImageNetA(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/datasets/imagenet-a/train/"
-        test_dir = "./data/datasets/imagenet-a/test/"
+        train_dir, test_dir = _imagefolder_paths("imagenet-a")
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -118,9 +126,7 @@ class CUB(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/datasets/cub/train/"
-        test_dir = "./data/datasets/cub/test/"
+        train_dir, test_dir = _imagefolder_paths("cub")
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -140,9 +146,7 @@ class vtab(iData):
     class_order = np.arange(50).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/datasets/vtab/train/"
-        test_dir = "./data/datasets/vtab/test/"
+        train_dir, test_dir = _imagefolder_paths("vtab")
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -163,12 +167,29 @@ class omnibenchmark(iData):
     class_order = np.arange(300).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/datasets/omnibenchmark/train/"
-        test_dir = "./data/datasets/omnibenchmark/test/"
+        train_dir, test_dir = _imagefolder_paths("omnibenchmark")
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+def _imagefolder_paths(dataset_name):
+    """Return prepared split paths, honoring the registry-selected data root."""
+    root = os.environ.get("RSIAT_DATASET_ROOT")
+    if root:
+        base = root
+    else:
+        data_root = os.environ.get("RSIAT_DATA_ROOT", "./data/datasets")
+        base = os.path.join(data_root, dataset_name)
+        if not os.path.isdir(base) and "-" in dataset_name:
+            base = os.path.join(data_root, dataset_name.replace("-", "_"))
+    train_dir, test_dir = os.path.join(base, "train"), os.path.join(base, "test")
+    if not os.path.isdir(train_dir) or not os.path.isdir(test_dir):
+        raise FileNotFoundError(
+            f"Prepared dataset is missing train/test directories: {base}. "
+            "Run scripts/prepare_dataset.py first."
+        )
+    return train_dir, test_dir
