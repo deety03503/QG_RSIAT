@@ -150,7 +150,7 @@ class StepModule(nn.Module):
             if old_features is None:
                 with torch.inference_mode():
                     old_features = self.old_network.extract_vector(images)
-            old_features = old_features.detach().float()
+            old_features = old_features.detach().clone().float()
             if self.mode == "rae":
                 if self.old_projector is None or old_prototypes is None:
                     raise RuntimeError("RAE alignment requires a projector and saved prototypes")
