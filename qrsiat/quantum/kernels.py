@@ -61,10 +61,11 @@ class PairwiseKernel(nn.Module):
             else:
                 centering_mean = None
                 if self.quantum.centering:
-                    centering_mean = (
-                        features.float().mean(dim=0, keepdim=True)
-                        + right.float().mean(dim=0, keepdim=True)
-                    ) / 2.0
+                    combined = torch.cat((features.float(), right.float()), dim=0)
+                    if self.training:
+                        centering_mean = self.quantum.center_ema.update(combined)
+                    else:
+                        centering_mean = self.quantum.center_ema.current(features)
                 states, _ = self.quantum(
                     features, centering_mean=centering_mean
                 )

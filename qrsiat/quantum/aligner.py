@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from .centering import EMACenter
 
 
 class QHybridAligner(nn.Module):
@@ -28,6 +29,7 @@ class QHybridAligner(nn.Module):
         self.up = nn.Linear(2 * n_qubits, input_dim, bias=False)
         nn.init.zeros_(self.up.weight)
         self.centering = centering
+        self.center_ema = EMACenter(input_dim)
         self.n_qubits = n_qubits
         self.layers = layers
     def __call__(
@@ -43,8 +45,10 @@ class QHybridAligner(nn.Module):
         values = features.float()
         if self.centering:
             if centering_mean is None:
-                if values.shape[0] > 1:
-                    centering_mean = values.mean(dim=0, keepdim=True)
+                if self.training:
+                    centering_mean = self.center_ema.update(values)
+                else:
+                    centering_mean = self.center_ema.current(values)
             else:
                 if centering_mean.ndim == 1:
                     centering_mean = centering_mean.unsqueeze(0)
