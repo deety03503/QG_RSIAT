@@ -9,7 +9,7 @@
     "model_name": "adapter",
     "convnet_type": "pretrained_vit_b16_224_in21k_adapter",
     "device": ["0"],
-    "seed": [1993],
+    "seed": [1992],
     
     "init_epochs":40,
     "warmup_epoch":3,
