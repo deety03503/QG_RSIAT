@@ -11,7 +11,7 @@
     "device": ["0"],
     "seed": [1993],
     
-    "init_epochs":20,
+    "init_epochs":40,
     "warmup_epoch":5,
     "inc_epochs":30,
     "ca_epochs":10,
