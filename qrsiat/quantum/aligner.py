@@ -31,18 +31,31 @@ class QHybridAligner(nn.Module):
         self.n_qubits = n_qubits
         self.layers = layers
     def __call__(
-        self, features: Any
+        self, features: Any, *, centering_mean: Any | None = None
     ) -> Any:
-        return super().__call__(features)
+        return super().__call__(features, centering_mean=centering_mean)
 
-    def forward(self, features: Any) -> Any:
+    def forward(self, features: Any, *, centering_mean: Any | None = None) -> Any:
         import torch
 
         if features.ndim != 2 or features.shape[1] != self.down.in_features:
             raise ValueError(f"features must have shape [B,{self.down.in_features}]")
         values = features.float()
         if self.centering:
-            values = torch.nn.functional.normalize(values, p=2, dim=1)
+            if centering_mean is None:
+                if values.shape[0] > 1:
+                    centering_mean = values.mean(dim=0, keepdim=True)
+            else:
+                if centering_mean.ndim == 1:
+                    centering_mean = centering_mean.unsqueeze(0)
+                if tuple(centering_mean.shape) != (1, self.down.in_features):
+                    raise ValueError(
+                        f"centering_mean must have shape [{self.down.in_features}] "
+                        f"or [1,{self.down.in_features}]"
+                    )
+                centering_mean = centering_mean.to(values)
+            if centering_mean is not None:
+                values = values - centering_mean
         angles = self.down(values).reshape(-1, self.layers, self.n_qubits)
         angles = angles.tanh() * torch.pi
         state = self.circuit(angles, self.theta)

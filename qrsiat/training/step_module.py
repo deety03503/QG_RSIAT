@@ -193,8 +193,10 @@ class StepModule(nn.Module):
                         )
                     if gamma:
                         if self.orth_kernel is not None:
+                            centering_mean = old_features.mean(dim=0, keepdim=True)
                             aligned_prototypes = self.aligner(
-                                old_prototypes.detach().float()
+                                old_prototypes.detach().float(),
+                                centering_mean=centering_mean,
                             )
                             similarity = self.orth_kernel(
                                 features.float(), aligned_prototypes.float()
@@ -211,8 +213,10 @@ class StepModule(nn.Module):
                                     weights * nn.functional.relu(values - orth_epsilon)
                                 ).sum(dim=1).mean()
                         else:
+                            centering_mean = old_features.mean(dim=0, keepdim=True)
                             projected_prototypes = self.aligner(
-                                old_prototypes.detach().float()
+                                old_prototypes.detach().float(),
+                                centering_mean=centering_mean,
                             )
                             normalized_features = nn.functional.normalize(projected_old, dim=1)
                             normalized_prototypes = nn.functional.normalize(projected_prototypes, dim=1)
