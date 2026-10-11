@@ -28,7 +28,7 @@ def parse_arguments() -> argparse.Namespace:
         description="Run RSIAT or opt-in QR-RSIAT continual learning."
     )
     parser.add_argument("--config", default="./exps/adapter_imageneta.json")
-    parser.add_argument("--seed", type=int)
+    parser.add_argument("--seed", type=int, default=1993)
     parser.add_argument("--mode", choices=("auto", "cpu", "single", "ddp", "jobpar"))
     parser.add_argument("--aligner", choices=("rae", "qhybrid"))
     parser.add_argument("--lambda_qrel", type=float)
