@@ -20,7 +20,7 @@
     "weight_decay":5.929828534160845e-07,
     "min_lr":0,
     "ffn_num":64,
-    "optimizer":"sgd",
+    "optimizer":"adamw",
 
     "scale":30.0,
     "margin":0.3,
@@ -33,4 +33,3 @@
     "ae_init_lr":0.0003120779977680931,
     "ae_weight_decay":2.424346330636298e-05
 }
-
