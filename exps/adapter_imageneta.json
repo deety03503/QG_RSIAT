@@ -1,7 +1,7 @@
 {
     "prefix": "all",
     "dataset": "imageneta",
-    "shuffle": false,
+    "shuffle": true,
     "ssca": true,
     "ca": true,
     "init_cls": 20,
@@ -22,7 +22,7 @@
     "ffn_num":64,
     "optimizer":"sgd",
 
-    "scale":35.0,
+    "scale":30.0,
     "margin":0.3,
     "alpha":1.0,
     "rs_margin":1,
