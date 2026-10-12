@@ -13,7 +13,7 @@
     
     "init_epochs":40,
     "warmup_epoch":10,
-    "inc_epochs":30,
+    "inc_epochs":40,
     "ca_epochs":10,
     "init_lr":0.01,
     "batch_size":48,
@@ -27,8 +27,8 @@
     "alpha":1.0,
     "rs_margin":0.8,
     "lambda_rs": 1.0,
-    "beta":4.0,
-    "gamma":5.0,
+    "beta":2.0,
+    "gamma":3.0,
     "ae_code_dims":128,
     "ae_init_lr":0.0003120779977680931,
     "ae_weight_decay":2.424346330636298e-05
