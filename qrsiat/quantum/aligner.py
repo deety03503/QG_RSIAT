@@ -16,6 +16,7 @@ class QHybridAligner(nn.Module):
         layers: int = 2,
         *,
         centering: bool = True,
+        cycle: bool = False,
     ) -> None:
         super().__init__()
         from .simulator import RealStatevectorCircuit
@@ -23,7 +24,7 @@ class QHybridAligner(nn.Module):
         if input_dim < 1:
             raise ValueError("input_dim must be positive")
         self.down = nn.Linear(input_dim, n_qubits * layers)
-        self.circuit = RealStatevectorCircuit(n_qubits, layers)
+        self.circuit = RealStatevectorCircuit(n_qubits, layers, cycle=cycle)
         self.theta = nn.Parameter(torch.zeros(layers, n_qubits))
         self.up = nn.Linear(2 * n_qubits, input_dim, bias=False)
         nn.init.zeros_(self.up.weight)

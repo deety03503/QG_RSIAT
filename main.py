@@ -23,6 +23,15 @@ from qrsiat.utils.report import write_runtime_report
 from trainer import RSIAT_train
 
 
+def _parse_bool(value: str) -> bool:
+    normalized = value.lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected True or False")
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run RSIAT or opt-in QR-RSIAT continual learning."
@@ -37,6 +46,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--rs_kernel", choices=("cosine", "quantum"))
     parser.add_argument("--n_qubits", type=int)
     parser.add_argument("--quantum_layers", type=int)
+    parser.add_argument(
+        "--cycle",
+        type=_parse_bool,
+        choices=(True, False),
+        default=None,
+        metavar="{True,False}",
+    )
     parser.add_argument(
         "--quantum_centering",
         action=argparse.BooleanOptionalAction,

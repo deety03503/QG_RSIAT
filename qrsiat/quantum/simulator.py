@@ -6,11 +6,14 @@ from typing import Any
 
 
 class RealStatevectorCircuit:
-    def __init__(self, n_qubits: int, layers: int) -> None:
+    def __init__(self, n_qubits: int, layers: int, *, cycle: bool = False) -> None:
         if n_qubits < 1 or layers < 1:
             raise ValueError("n_qubits and layers must be positive")
+        if not isinstance(cycle, bool):
+            raise TypeError("cycle must be a boolean")
         self.n_qubits = n_qubits
         self.layers = layers
+        self.cycle = cycle
 
     def __call__(self, angles: Any, trainable_angles: Any | None = None) -> Any:
         import torch
@@ -51,6 +54,14 @@ class RealStatevectorCircuit:
                 source = torch.where(
                     (basis & (1 << control)) != 0,
                     basis ^ (1 << target),
+                    basis,
+                )
+                state = state.index_select(1, source)
+            if self.cycle and self.n_qubits > 1:
+                control = self.n_qubits - 1
+                source = torch.where(
+                    (basis & (1 << control)) != 0,
+                    basis ^ 1,
                     basis,
                 )
                 state = state.index_select(1, source)

@@ -23,6 +23,7 @@ class QRsiatConfig:
     n_qubits: int = 8
     quantum_layers: int = 2
     quantum_centering: bool = True
+    cycle: bool = False
     pair_gather: bool | None = None
     lr_scale_by_world: bool = False
     num_workers: int | None = None
@@ -84,6 +85,7 @@ class QRsiatConfig:
             raise ValueError("time_budget_h must be finite")
         bool_fields = (
             "quantum_centering",
+            "cycle",
             "lr_scale_by_world",
             "use_compile",
             "freeze_cast",

@@ -18,12 +18,13 @@ class QuantumFeatureMap(nn.Module):
         layers: int = 2,
         *,
         centering: bool = True,
+        cycle: bool = False,
     ) -> None:
         super().__init__()
         if input_dim < 1:
             raise ValueError("input_dim must be positive")
         self.project = nn.Linear(input_dim, n_qubits * layers)
-        self.simulator = RealStatevectorCircuit(n_qubits, layers)
+        self.simulator = RealStatevectorCircuit(n_qubits, layers, cycle=cycle)
         self.centering = centering
         self.n_qubits = n_qubits
         self.layers = layers

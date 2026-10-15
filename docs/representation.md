@@ -30,7 +30,7 @@ với \(\ell=1,\ldots,L\), \(j=1,\ldots,q\). \(W_q,b_q\) là tham số chiếu c
 Mỗi mẫu bắt đầu ở trạng thái cơ sở \(\lvert 0\rangle^{\otimes q}\), tương ứng vector đơn vị có \(2^q\) phần tử. Ở mỗi lớp \(\ell\):
 
 1. Áp dụng cổng quay \(R_Y(\alpha_{\ell j})\) lên từng qubit \(j\).
-2. Entangle các qubit bằng chuỗi CNOT lân cận \(0\to1,1\to2,\ldots,q-2\to q-1\).
+2. Entangle các qubit bằng chuỗi CNOT lân cận \(0\to1,1\to2,\ldots,q-2\to q-1\). Tùy chọn `--cycle True` thêm CNOT vòng \(q-1\to0\) ở mỗi lớp; mặc định `--cycle False` giữ nguyên chuỗi.
 
 State mã hóa cuối cùng là:
 
