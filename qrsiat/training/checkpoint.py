@@ -69,6 +69,7 @@ class CheckpointManager:
         modules: dict[str, Any],
         config: dict[str, Any],
         *,
+        kernel_policy: str | None = None,
         full_state_modules: set[str] | frozenset[str] = frozenset(),
         optimizer: Any | None = None,
         metadata: dict[str, Any] | None = None,
@@ -87,11 +88,13 @@ class CheckpointManager:
                 + ", ".join(sorted(unknown_full_state_modules))
             )
         digest = configuration_digest(config)
+        policy = kernel_policy or config.get("kernel_policy", "legacy")
         payload = {
             "schema_version": 1,
             "task": task,
             "config_digest": digest,
             "config": config,
+            "kernel_policy": policy,
             "modules": {
                 name: (
                     module.state_dict()
@@ -190,6 +193,16 @@ class CheckpointManager:
             payload = torch.load(checkpoint, map_location=map_location)
         if not isinstance(payload, dict) or payload.get("schema_version") != 1:
             raise ValueError(f"Unsupported or malformed checkpoint: {checkpoint}")
+        saved_policy = payload.get("kernel_policy")
+        if saved_policy is None:
+            saved_policy = payload.get("config", {}).get("kernel_policy", "legacy")
+        current_policy = config.get("kernel_policy", "legacy")
+        if saved_policy != current_policy:
+            raise ValueError(
+                f"Checkpoint kernel policy mismatch for {checkpoint}: "
+                f"saved={saved_policy!r}, current={current_policy!r}. "
+                "Resuming with a different kernel policy is not supported."
+            )
         expected = configuration_digest(config)
         observed = payload.get("config_digest")
         if observed != expected and not force:

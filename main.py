@@ -41,6 +41,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("auto", "cpu", "single", "ddp", "jobpar"))
     parser.add_argument("--aligner", choices=("rae", "qhybrid"))
     parser.add_argument("--lambda_qrel", type=float)
+    parser.add_argument("--kernel_policy", choices=("legacy", "shared_frozen", "fixed_calibrated"), default=None)
     parser.add_argument("--kernel", choices=("quantum", "cosine", "rbf", "mlp"))
     parser.add_argument("--orth", choices=("plain", "qweighted"))
     parser.add_argument("--rs_kernel", choices=("quantum", "cosine", "rbf", "mlp"))

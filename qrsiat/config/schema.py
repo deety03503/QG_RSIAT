@@ -13,6 +13,7 @@ class QRsiatConfig:
     mode: str = "auto"
     aligner: str = "rae"
     lambda_qrel: float = 0.0
+    kernel_policy: str = "legacy"
     pretrained_weights: str | None = None
     kernel: str = "cosine"
     orth: str = "plain"
@@ -49,6 +50,7 @@ class QRsiatConfig:
         string_fields = (
             "mode",
             "aligner",
+            "kernel_policy",
             "kernel",
             "orth",
             "output_dir",
@@ -132,6 +134,8 @@ class QRsiatConfig:
             raise ValueError(f"Unsupported mode: {self.mode!r}")
         if self.aligner not in {"rae", "qhybrid"}:
             raise ValueError(f"Unsupported aligner: {self.aligner!r}")
+        if self.kernel_policy not in {"legacy", "shared_frozen", "fixed_calibrated"}:
+            raise ValueError(f"Unsupported kernel_policy: {self.kernel_policy!r}")
         if self.kernel not in {"quantum", "cosine", "rbf", "mlp"}:
             raise ValueError(f"Unsupported kernel: {self.kernel!r}")
         if self.orth not in {"plain", "qweighted"}:

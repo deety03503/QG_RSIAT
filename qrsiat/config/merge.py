@@ -27,24 +27,35 @@ def merge_config(
         raise ValueError(f"Unknown QR-RSIAT override keys: {', '.join(unknown)}")
 
     legacy_values = {key: legacy[key] for key in config_keys if key in legacy}
-    if "kernel" in explicit or "rs_kernel" in explicit:
-        selected_kernel = explicit.get("kernel", explicit.get("rs_kernel"))
-        legacy_values["kernel"] = selected_kernel
-        legacy_values["rs_kernel"] = selected_kernel
+    policy = explicit.get("kernel_policy", legacy_values.get("kernel_policy", "legacy"))
+    if policy in {"shared_frozen", "fixed_calibrated"}:
+        if "kernel" in explicit or "rs_kernel" in explicit:
+            selected_kernel = explicit.get("kernel", explicit.get("rs_kernel"))
+            legacy_values["kernel"] = selected_kernel
+            legacy_values["rs_kernel"] = selected_kernel
+        elif "kernel" in legacy_values and "rs_kernel" not in legacy_values:
+            legacy_values["rs_kernel"] = legacy_values["kernel"]
+        elif "rs_kernel" in legacy_values and "kernel" not in legacy_values:
+            legacy_values["kernel"] = legacy_values["rs_kernel"]
     elif "kernel" in legacy_values and "rs_kernel" not in legacy_values:
         legacy_values["rs_kernel"] = legacy_values["kernel"]
     elif "rs_kernel" in legacy_values and "kernel" not in legacy_values:
         legacy_values["kernel"] = legacy_values["rs_kernel"]
     merged_values = QRsiatConfig.from_mapping(legacy_values).to_dict()
     merged_values.update(explicit)
-    if "kernel" in explicit and "rs_kernel" not in explicit:
+    if policy in {"shared_frozen", "fixed_calibrated"}:
+        if "kernel" in explicit and "rs_kernel" not in explicit:
+            merged_values["rs_kernel"] = explicit["kernel"]
+        elif "rs_kernel" in explicit and "kernel" not in explicit:
+            merged_values["kernel"] = explicit["rs_kernel"]
+        elif "kernel" in legacy_values and "rs_kernel" not in legacy_values:
+            merged_values["rs_kernel"] = merged_values["kernel"]
+        elif "rs_kernel" in legacy_values and "kernel" not in legacy_values:
+            merged_values["kernel"] = merged_values["rs_kernel"]
+    elif "kernel" in explicit and "rs_kernel" not in explicit and "rs_kernel" not in legacy_values:
         merged_values["rs_kernel"] = explicit["kernel"]
-    elif "rs_kernel" in explicit and "kernel" not in explicit:
+    elif "rs_kernel" in explicit and "kernel" not in explicit and "kernel" not in legacy_values:
         merged_values["kernel"] = explicit["rs_kernel"]
-    elif "kernel" in legacy_values and "rs_kernel" not in legacy_values:
-        merged_values["rs_kernel"] = merged_values["kernel"]
-    elif "rs_kernel" in legacy_values and "kernel" not in legacy_values:
-        merged_values["kernel"] = merged_values["rs_kernel"]
     if merged_values["rs_kernel"] is None:
         merged_values["rs_kernel"] = merged_values["kernel"]
     validated = QRsiatConfig.from_mapping(merged_values).to_dict()
@@ -64,7 +75,7 @@ def merge_config(
         raise ValueError("lambda_qrel > 0 requires a positive beta coefficient.")
     if validated["orth"] == "qweighted" and gamma <= 0:
         raise ValueError("--orth qweighted requires a positive gamma coefficient.")
-    if validated["kernel"] in {"quantum", "mlp"}:
+    if validated["kernel_policy"] != "fixed_calibrated" and validated["kernel"] in {"quantum", "mlp"}:
         lambda_rs = result.get("lambda_rs", 0.0)
         if (
             isinstance(lambda_rs, bool)

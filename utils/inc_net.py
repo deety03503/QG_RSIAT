@@ -2,8 +2,13 @@ import copy
 import logging
 import torch
 from torch import nn
-from network.classifier import  CosineLinear, SimpleContinualLinear
-import timm
+from network.classifier import CosineLinear, SimpleContinualLinear
+try:
+    import timm
+except ImportError:
+    timm = None
+
+
 
 
 def get_convnet(args, pretrained=False):

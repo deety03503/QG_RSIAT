@@ -25,6 +25,9 @@ class StepModule(nn.Module):
         rs_loss: nn.Module | None = None,
         old_network: nn.Module | None = None,
         aligner: nn.Module | None = None,
+        relational_kernel: nn.Module | None = None,
+        relational_kernel_teacher: nn.Module | None = None,
+        orth_kernel: nn.Module | None = None,
         kernel: nn.Module | None = None,
         old_projector: nn.Module | None = None,
         mode: str = "rae",
@@ -39,6 +42,9 @@ class StepModule(nn.Module):
         self.rs_loss = rs_loss
         self.old_network = old_network
         self.aligner = aligner
+        self.relational_kernel = relational_kernel
+        self.relational_kernel_teacher = relational_kernel_teacher
+        self.orth_kernel = orth_kernel
         self.kernel = kernel
         self.old_projector = old_projector
         self.mode = mode
@@ -74,15 +80,21 @@ class StepModule(nn.Module):
         if self.old_network is not None:
             self.old_network.requires_grad_(False)
             self.old_network.eval()
+        if self.relational_kernel_teacher is not None:
+            self.relational_kernel_teacher.requires_grad_(False)
+            self.relational_kernel_teacher.eval()
 
     def train(self, mode: bool = True) -> "StepModule":
         super().train(mode)
         if self.old_network is not None:
             self.old_network.eval()
-        if self.kernel is not None and not any(
-            parameter.requires_grad for parameter in self.kernel.parameters()
-        ):
-            self.kernel.eval()
+        if self.relational_kernel_teacher is not None:
+            self.relational_kernel_teacher.eval()
+        for k in (self.relational_kernel, self.orth_kernel, self.kernel):
+            if k is not None and not any(
+                parameter.requires_grad for parameter in k.parameters()
+            ):
+                k.eval()
         return self
 
     def forward(
@@ -115,15 +127,18 @@ class StepModule(nn.Module):
             loss_cls = classification_loss(selected_logits, selected_labels)
 
         zero = logits.sum() * 0.0
+        seen_parameters = set()
         for component in (
             self.rs_loss,
             self.aligner,
-            self.kernel,
+            self.relational_kernel,
+            self.orth_kernel,
             self.old_projector,
         ):
             if component is not None:
                 for parameter in component.parameters():
-                    if parameter.requires_grad:
+                    if parameter.requires_grad and id(parameter) not in seen_parameters:
+                        seen_parameters.add(id(parameter))
                         zero = zero + parameter.sum() * 0.0
         total = loss_cls
         loss_rs = zero
@@ -134,17 +149,18 @@ class StepModule(nn.Module):
             raise RuntimeError("lambda_rs is non-zero but StepModule has no RS loss")
         if self.rs_loss is not None and lambda_rs:
             rs_features, rs_labels = self._gather_pairs(features, labels)
+            active_rs_kernel = getattr(self.rs_loss, "kernel", None) or self.kernel or self.relational_kernel
             if (
                 getattr(self.rs_loss, "requires_full_precision", False)
-                or self.kernel is not None
+                or active_rs_kernel is not None
             ):
                 with full_precision_context(features.device):
                     loss_rs = float(lambda_rs) * self.rs_loss(
-                        rs_features.float(), rs_labels, kernel=self.kernel
+                        rs_features.float(), rs_labels, kernel=active_rs_kernel
                     )
             else:
                 loss_rs = float(lambda_rs) * self.rs_loss(
-                    rs_features, rs_labels, kernel=self.kernel
+                    rs_features, rs_labels, kernel=active_rs_kernel
                 )
 
         if self.old_network is not None and (beta or gamma or self.mode == "rae"):
@@ -170,15 +186,21 @@ class StepModule(nn.Module):
                     projected_old = self.aligner(old_features)
                     loss_align = nn.functional.mse_loss(features.float(), projected_old.float())
                     if beta and lambda_qrel:
-                        if self.kernel is None:
+                        active_rel_kernel = self.relational_kernel or self.kernel
+                        active_teacher_kernel = self.relational_kernel_teacher or self.kernel
+                        if active_rel_kernel is None:
                             raise RuntimeError(
-                                "lambda_qrel is non-zero but no shared kernel is configured"
+                                "lambda_qrel is non-zero but no relational kernel is configured"
+                            )
+                        if active_teacher_kernel is None:
+                            raise RuntimeError(
+                                "lambda_qrel requires a frozen relational-kernel teacher"
                             )
                         current_global, _ = self._gather_pairs(features, labels)
                         previous_global, _ = self._gather_pairs(old_features, labels)
-                        current_kernel = self.kernel(current_global.float())
+                        current_kernel = active_rel_kernel(current_global.float())
                         with torch.no_grad():
-                            previous_kernel = self.kernel(previous_global.float())
+                            previous_kernel = active_teacher_kernel(previous_global.float())
                         loss_rel = float(beta) * float(lambda_qrel) * (
                             (current_kernel - previous_kernel.detach()).square().mean()
                         )
@@ -187,13 +209,16 @@ class StepModule(nn.Module):
                             "Incremental orthogonality requires saved old prototypes"
                         )
                     if gamma:
-                        if self.kernel is not None:
+                        active_orth_kernel = self.orth_kernel
+                        if active_orth_kernel is None and self.kernel is not None:
+                            active_orth_kernel = self.kernel
+                        if active_orth_kernel is not None:
                             centering_mean = old_features.mean(dim=0, keepdim=True)
                             aligned_prototypes = self.aligner(
                                 old_prototypes.detach().float(),
                                 centering_mean=centering_mean,
                             )
-                            similarity = self.kernel(
+                            similarity = active_orth_kernel(
                                 features.float(), aligned_prototypes.float()
                             )
                             if similarity.shape[1] == 0:

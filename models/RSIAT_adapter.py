@@ -76,23 +76,14 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         self.logit_norm = None
         self.tuned_epochs = None
         self.aligner_mode = args.get("aligner", "rae")
+        self.kernel_policy = args.get("kernel_policy", "legacy")
         self.qhybrid = None
-        kernel_name = args.get("kernel", "cosine")
-        rs_kernel_name = args.get("rs_kernel") or kernel_name
-        if rs_kernel_name != kernel_name:
-            raise ValueError(
-                "The shared kernel requires 'kernel' and 'rs_kernel' to match"
-            )
-        if args.get("orth", "plain") == "qweighted" and kernel_name != "quantum":
-            raise ValueError("--orth qweighted requires the shared kernel to be quantum")
-        self.kernel = PairwiseKernel(
-            kernel_name,
-            n_qubits=args.get("n_qubits", 8),
-            layers=args.get("quantum_layers", 2),
-            centering=args.get("quantum_centering", True),
-            cycle=args.get("cycle", False),
-            input_norm=args.get("input_norm", "none"),
-        )
+        self.kernel = None
+        self.relational_kernel = None
+        self.relational_kernel_teacher = None
+        self.orth_kernel = None
+        self.rs_kernel = None
+
         if self.aligner_mode == "qhybrid":
             self.qhybrid = QHybridAligner(
                 n_qubits=args.get("n_qubits", 8),
@@ -100,10 +91,75 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 centering=args.get("quantum_centering", True),
                 cycle=args.get("cycle", False),
             )
-        self.rs_loss_func = RS_Loss(
-            self.args["alpha"],
-            self.args["rs_margin"],
-        )
+
+        if self.kernel_policy == "legacy":
+            if args.get("lambda_qrel", 0.0) > 0:
+                self.relational_kernel = PairwiseKernel(
+                    args.get("kernel", "cosine"),
+                    n_qubits=args.get("n_qubits", 8),
+                    layers=args.get("quantum_layers", 2),
+                    centering=args.get("quantum_centering", True),
+                    cycle=args.get("cycle", False),
+                    input_norm=args.get("input_norm", "none"),
+                )
+            if args.get("orth", "plain") == "qweighted":
+                self.orth_kernel = PairwiseKernel(
+                    "quantum",
+                    n_qubits=args.get("n_qubits", 8),
+                    layers=args.get("quantum_layers", 2),
+                    centering=args.get("quantum_centering", True),
+                    cycle=args.get("cycle", False),
+                    input_norm=args.get("input_norm", "none"),
+                )
+            if args.get("rs_kernel", "cosine") == "quantum":
+                self.rs_kernel = PairwiseKernel(
+                    "quantum",
+                    n_qubits=args.get("n_qubits", 8),
+                    layers=args.get("quantum_layers", 2),
+                    centering=args.get("quantum_centering", True),
+                    cycle=args.get("cycle", False),
+                    input_norm=args.get("input_norm", "none"),
+                )
+            self.rs_loss_func = RS_Loss(
+                self.args["alpha"],
+                self.args["rs_margin"],
+                kernel=self.rs_kernel,
+            )
+        elif self.kernel_policy in {"shared_frozen", "fixed_calibrated"}:
+            kernel_name = args.get("kernel", "cosine")
+            rs_kernel_name = args.get("rs_kernel") or kernel_name
+            if rs_kernel_name != kernel_name:
+                raise ValueError(
+                    "The shared kernel requires 'kernel' and 'rs_kernel' to match"
+                )
+            if args.get("orth", "plain") == "qweighted" and kernel_name != "quantum":
+                raise ValueError("--orth qweighted requires the shared kernel to be quantum")
+            self.kernel = PairwiseKernel(
+                kernel_name,
+                n_qubits=args.get("n_qubits", 8),
+                layers=args.get("quantum_layers", 2),
+                centering=args.get("quantum_centering", True),
+                cycle=args.get("cycle", False),
+                input_norm=args.get("input_norm", "none"),
+            )
+            self.rs_kernel = self.kernel
+            if self.kernel_policy == "fixed_calibrated":
+                self.kernel.requires_grad_(False)
+                self.kernel.eval()
+                if args.get("lambda_qrel", 0.0) > 0:
+                    self.relational_kernel = self.kernel
+                    self.relational_kernel_teacher = copy.deepcopy(self.kernel)
+                    self.relational_kernel_teacher.requires_grad_(False)
+                    self.relational_kernel_teacher.eval()
+                if args.get("orth", "plain") == "qweighted":
+                    self.orth_kernel = self.kernel
+            self.rs_loss_func = RS_Loss(
+                self.args["alpha"],
+                self.args["rs_margin"],
+                kernel=self.rs_kernel,
+            )
+        else:
+            raise ValueError(f"Unsupported kernel_policy: {self.kernel_policy!r}")
         self.loss_cos = AngularPenaltySMLoss(
             loss_type="cosface",
             eps=1e-7,
@@ -165,10 +221,39 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             ).to(self._device)
         elif self.qhybrid is not None:
             self.qhybrid.to(self._device)
-        self.kernel.to(self._device)
-        if self._cur_task > 0:
-            self.kernel.requires_grad_(False)
-            self.kernel.eval()
+        if self.kernel_policy == "legacy":
+            if self.relational_kernel is not None:
+                self.relational_kernel.to(self._device)
+                if self._cur_task > 0:
+                    self.relational_kernel_teacher = copy.deepcopy(self.relational_kernel)
+                    self.relational_kernel_teacher.to(self._device)
+                    self.relational_kernel_teacher.requires_grad_(False)
+                    self.relational_kernel_teacher.eval()
+            if self.orth_kernel is not None:
+                self.orth_kernel.to(self._device)
+            if self.rs_kernel is not None:
+                self.rs_kernel.to(self._device)
+        elif self.kernel_policy == "shared_frozen":
+            self.kernel.to(self._device)
+            if self._cur_task > 0:
+                self.kernel.requires_grad_(False)
+                self.kernel.eval()
+                if self.args.get("lambda_qrel", 0.0) > 0:
+                    self.relational_kernel = self.kernel
+                    self.relational_kernel_teacher = copy.deepcopy(self.kernel)
+                    self.relational_kernel_teacher.to(self._device)
+                    self.relational_kernel_teacher.requires_grad_(False)
+                    self.relational_kernel_teacher.eval()
+                if self.args.get("orth", "plain") == "qweighted":
+                    self.orth_kernel = self.kernel
+        elif self.kernel_policy == "fixed_calibrated":
+            self.kernel.to(self._device)
+            if self.relational_kernel is not None:
+                self.relational_kernel.to(self._device)
+            if self.relational_kernel_teacher is not None:
+                self.relational_kernel_teacher.to(self._device)
+            if self.orth_kernel is not None:
+                self.orth_kernel.to(self._device)
             
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         # self._network.update_fc(data_manager.get_task_size(self._cur_task)*4)
@@ -332,6 +417,9 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             rs_loss=self.rs_loss_func if self._cur_task == 0 else None,
             old_network=old_network,
             aligner=self.qhybrid,
+            relational_kernel=self.relational_kernel,
+            relational_kernel_teacher=self.relational_kernel_teacher,
+            orth_kernel=self.orth_kernel,
             kernel=self.kernel,
             old_projector=self.old_ae,
             mode=self.aligner_mode,
@@ -433,14 +521,25 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         modules = {"network": self._network}
         if self.qhybrid is not None:
             modules["qhybrid"] = self.qhybrid
-        modules["kernel"] = self.kernel
+        if self.kernel_policy == "legacy":
+            if self.relational_kernel is not None:
+                modules["relational_kernel"] = self.relational_kernel
+            if self.orth_kernel is not None:
+                modules["orth_kernel"] = self.orth_kernel
+            if self.rs_kernel is not None:
+                modules["rs_kernel"] = self.rs_kernel
+            full_state_modules = {"relational_kernel", "orth_kernel", "rs_kernel"}.intersection(modules.keys())
+        else:
+            modules["kernel"] = self.kernel
+            full_state_modules = {"kernel"}
         if self.old_ae is not None:
             modules["old_ae"] = self.old_ae
         manager.save(
             self._cur_task,
             modules,
             self.args.get("checkpoint_config", {}),
-            full_state_modules={"kernel"},
+            kernel_policy=self.kernel_policy,
+            full_state_modules=full_state_modules,
             metadata={
                 "known_classes": self._known_classes,
                 "total_classes": self._total_classes,
@@ -499,43 +598,27 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 input_dims=768, code_dims=self.args["ae_code_dims"]
             ).to(self._device)
         modules = {"network": self._network}
-        saved_modules = payload.get("modules")
-        if isinstance(saved_modules, dict) and "kernel" not in saved_modules:
-            legacy_kernel = saved_modules.get("rs_kernel")
-            if legacy_kernel is None and any(
-                parameter.requires_grad for parameter in self.kernel.parameters()
-            ):
-                raise ValueError(
-                    "This legacy checkpoint has no base-task RS kernel to restore. "
-                    "Start a new run to train the shared kernel on the base task."
-                )
-            if legacy_kernel is not None:
-                expected_state = self.kernel.state_dict()
-                unexpected_keys = set(legacy_kernel) - set(expected_state)
-                incompatible_shapes = [
-                    name
-                    for name, value in legacy_kernel.items()
-                    if name in expected_state
-                    and tuple(value.shape) != tuple(expected_state[name].shape)
-                ]
-                if unexpected_keys or incompatible_shapes:
-                    raise ValueError(
-                        "The legacy RS kernel architecture does not match the "
-                        "configured shared kernel; start a new run."
-                    )
-            payload = dict(payload)
-            payload["modules"] = {
-                name: state
-                for name, state in saved_modules.items()
-                if name not in {"relational_kernel", "orth_kernel", "rs_kernel"}
-            }
-            payload["modules"]["kernel"] = legacy_kernel or {}
-            logging.info("Migrating the legacy base-task RS kernel to the shared kernel.")
-        for name in ("qhybrid", "kernel", "old_ae"):
-            module = getattr(self, name, None)
-            if module is not None:
-                modules[name] = module
+        if self.kernel_policy == "legacy":
+            for name in ("qhybrid", "relational_kernel", "orth_kernel", "rs_kernel", "old_ae"):
+                module = getattr(self, name, None)
+                if module is not None:
+                    modules[name] = module
+        else:
+            for name in ("qhybrid", "kernel", "old_ae"):
+                module = getattr(self, name, None)
+                if module is not None:
+                    modules[name] = module
         manager.restore_modules(payload, modules, restore_rng=True)
+        if self.kernel_policy == "shared_frozen" and task >= 0:
+            self.kernel.requires_grad_(False)
+            self.kernel.eval()
+            if self.args.get("lambda_qrel", 0.0) > 0:
+                self.relational_kernel = self.kernel
+                self.relational_kernel_teacher = copy.deepcopy(self.kernel)
+                self.relational_kernel_teacher.requires_grad_(False)
+                self.relational_kernel_teacher.eval()
+            if self.args.get("orth", "plain") == "qweighted":
+                self.orth_kernel = self.kernel
         self._class_means = np.asarray(metadata["class_means"], dtype=np.float64)
         self._class_covs = torch.as_tensor(
             metadata["class_covariances"],
@@ -874,7 +957,8 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
     def _maybe_calibrate_kernel(self, data_manager):
         if not self.args.get("kernel_calibration", False):
             return
-        if self.kernel is None or self.kernel.quantum is None:
+        target_kernel = getattr(self, "kernel", None) or getattr(self, "rs_kernel", None) or getattr(self, "relational_kernel", None)
+        if target_kernel is None or getattr(target_kernel, "quantum", None) is None:
             return
         context = self.args.get("runtime_context")
         if context is not None and not context.is_main:
@@ -915,13 +999,19 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         labels = torch.cat(all_labels, dim=0)
         target = float(self.args.get("kernel_target_median", 0.1))
         best_gamma = calibrate_bandwidth(
-            self.kernel.quantum, feats, labels=labels, target=target
+            target_kernel.quantum, feats, labels=labels, target=target
         )
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.broadcast(self.kernel.quantum.bandwidth, src=0)
+            torch.distributed.broadcast(target_kernel.quantum.bandwidth, src=0)
+        if (
+            self.kernel_policy != "legacy"
+            and self.relational_kernel_teacher is not None
+            and getattr(self.relational_kernel_teacher, "quantum", None) is not None
+        ):
+            self.relational_kernel_teacher.quantum.bandwidth.copy_(target_kernel.quantum.bandwidth)
         from qrsiat.quantum.simulator import fidelity_kernel
         with torch.no_grad(), full_precision_context(self._device):
-            state, _ = self.kernel.quantum(feats)
+            state, _ = target_kernel.quantum(feats)
             k = fidelity_kernel(state)
             n = feats.shape[0]
             mask = ~torch.eye(n, dtype=torch.bool, device=feats.device)
@@ -969,16 +1059,25 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             }
             result.update(self._quantum_input_stats(features, normalized))
 
-            rs_features = features if getattr(self.kernel, "input_norm", "none") != "none" else normalized
-            rs_matrix = self.kernel(rs_features)
-            qrel_matrix = self.kernel(features)
-            result["kernel_rs"] = kernel_diagnostics(rs_matrix, labels)
-            result["kernel_qrel"] = kernel_diagnostics(qrel_matrix, labels)
+            active_rs_kernel = self.kernel if self.kernel is not None else self.rs_kernel
+            active_qrel_kernel = self.kernel if self.kernel is not None else self.relational_kernel
+            if active_rs_kernel is not None:
+                rs_features = features if getattr(active_rs_kernel, "input_norm", "none") != "none" else normalized
+                rs_matrix = active_rs_kernel(rs_features)
+                result["kernel_rs"] = kernel_diagnostics(rs_matrix, labels)
+            else:
+                result["kernel_rs"] = None
+            if active_qrel_kernel is not None:
+                qrel_matrix = active_qrel_kernel(features)
+                result["kernel_qrel"] = kernel_diagnostics(qrel_matrix, labels)
+            else:
+                result["kernel_qrel"] = None
             result.update(self._qorth_diagnostics(features))
             result.update(self._quantum_parameter_norms())
+            active_quantum_kernel = active_rs_kernel or active_qrel_kernel
             result["bandwidth"] = (
-                float(self.kernel.quantum.bandwidth.item())
-                if self.kernel.quantum is not None
+                float(active_quantum_kernel.quantum.bandwidth.item())
+                if active_quantum_kernel is not None and getattr(active_quantum_kernel, "quantum", None) is not None
                 else None
             )
             current_features = features.detach()
@@ -1003,7 +1102,8 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
 
     def _quantum_input_stats(self, features, normalized):
         stats = {}
-        quantum = self.kernel.quantum
+        active_k = self.kernel or self.rs_kernel or self.relational_kernel
+        quantum = getattr(active_k, "quantum", None) if active_k is not None else None
         if quantum is None:
             stats.update({
                 "sigma_u_raw": None,
@@ -1026,7 +1126,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
     def _qorth_diagnostics(self, features):
         result = {
             "qorth_G_topk": [],
-            "qorth_top1_gt_epsilon_probability": None,
+            "qorth_top1_gt_epsilon_probability": 0.0,
             "aligned_prototype_distance": None,
         }
         if self._cur_task == 0 or self._class_means is None:
@@ -1036,14 +1136,15 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             dtype=torch.float32,
             device=features.device,
         )
-        if self.aligner_mode == "qhybrid" and self.qhybrid is not None:
+        active_orth = self.orth_kernel or self.kernel
+        if self.aligner_mode == "qhybrid" and self.qhybrid is not None and active_orth is not None:
             with torch.no_grad():
                 old_features = self._features_for_diagnostics(
                     self._diagnostic_batch[0], self.old_network_module_ptr
                 )
                 mean = old_features.mean(dim=0, keepdim=True)
                 aligned = self.qhybrid(prototypes, centering_mean=mean)
-            similarity = self.kernel(features, aligned)
+            similarity = active_orth(features, aligned)
         elif self.old_ae is not None:
             with torch.no_grad():
                 old_features = self._features_for_diagnostics(
@@ -1073,7 +1174,8 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         return result
 
     def _quantum_parameter_norms(self):
-        quantum = self.kernel.quantum
+        active_k = self.kernel or self.rs_kernel or self.relational_kernel
+        quantum = getattr(active_k, "quantum", None) if active_k is not None else None
         aligner = self.qhybrid
         return {
             "W_q_fro": (
