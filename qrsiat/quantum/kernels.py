@@ -16,6 +16,7 @@ class PairwiseKernel(nn.Module):
         n_qubits: int = 8,
         layers: int = 2,
         centering: bool = True,
+        cycle: bool = False,
         hidden_dim: int | None = None,
     ) -> None:
         super().__init__()
@@ -27,7 +28,9 @@ class PairwiseKernel(nn.Module):
         if name == "quantum":
             from .feature_map import QuantumFeatureMap
 
-            self.quantum = QuantumFeatureMap(input_dim, n_qubits, layers, centering=centering)
+            self.quantum = QuantumFeatureMap(
+                input_dim, n_qubits, layers, centering=centering, cycle=cycle
+            )
         elif name == "mlp":
             width = hidden_dim or input_dim
             self.projector = nn.Sequential(

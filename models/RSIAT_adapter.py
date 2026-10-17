@@ -77,6 +77,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 n_qubits=args.get("n_qubits", 8),
                 layers=args.get("quantum_layers", 2),
                 centering=args.get("quantum_centering", True),
+                cycle=args.get("cycle", False),
             )
         if args.get("lambda_qrel", 0.0) > 0:
             self.relational_kernel = PairwiseKernel(
@@ -84,6 +85,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 n_qubits=args.get("n_qubits", 8),
                 layers=args.get("quantum_layers", 2),
                 centering=args.get("quantum_centering", True),
+                cycle=args.get("cycle", False),
             )
         if args.get("orth", "plain") == "qweighted":
             self.orth_kernel = PairwiseKernel(
@@ -91,6 +93,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 n_qubits=args.get("n_qubits", 8),
                 layers=args.get("quantum_layers", 2),
                 centering=args.get("quantum_centering", True),
+                cycle=args.get("cycle", False),
             )
         if args.get("rs_kernel", "cosine") == "quantum":
             self.rs_kernel = PairwiseKernel(
@@ -98,6 +101,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 n_qubits=args.get("n_qubits", 8),
                 layers=args.get("quantum_layers", 2),
                 centering=args.get("quantum_centering", True),
+                cycle=args.get("cycle", False),
             )
         self.rs_loss_func = RS_Loss(
             self.args["alpha"],
@@ -161,6 +165,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 n_qubits=self.args.get("n_qubits", 8),
                 layers=self.args.get("quantum_layers", 2),
                 centering=self.args.get("quantum_centering", True),
+                cycle=self.args.get("cycle", False),
             ).to(self._device)
         elif self.qhybrid is not None:
             self.qhybrid.to(self._device)
