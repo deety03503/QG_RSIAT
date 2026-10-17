@@ -14,7 +14,7 @@
     "init_epochs":20,
     "warmup_epoch":3,
     "inc_epochs":20,
-    "ca_epochs":10,
+    "ca_epochs":20,
     "init_lr":0.01,
     "batch_size":48,
     "weight_decay":5.929828534160845e-07,
