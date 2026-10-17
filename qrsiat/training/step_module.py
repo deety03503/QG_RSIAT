@@ -25,9 +25,7 @@ class StepModule(nn.Module):
         rs_loss: nn.Module | None = None,
         old_network: nn.Module | None = None,
         aligner: nn.Module | None = None,
-        relational_kernel: nn.Module | None = None,
-        relational_kernel_teacher: nn.Module | None = None,
-        orth_kernel: nn.Module | None = None,
+        kernel: nn.Module | None = None,
         old_projector: nn.Module | None = None,
         mode: str = "rae",
         pair_gather: bool = False,
@@ -41,9 +39,7 @@ class StepModule(nn.Module):
         self.rs_loss = rs_loss
         self.old_network = old_network
         self.aligner = aligner
-        self.relational_kernel = relational_kernel
-        self.relational_kernel_teacher = relational_kernel_teacher
-        self.orth_kernel = orth_kernel
+        self.kernel = kernel
         self.old_projector = old_projector
         self.mode = mode
         self.pair_gather = pair_gather
@@ -78,16 +74,15 @@ class StepModule(nn.Module):
         if self.old_network is not None:
             self.old_network.requires_grad_(False)
             self.old_network.eval()
-        if self.relational_kernel_teacher is not None:
-            self.relational_kernel_teacher.requires_grad_(False)
-            self.relational_kernel_teacher.eval()
 
     def train(self, mode: bool = True) -> "StepModule":
         super().train(mode)
         if self.old_network is not None:
             self.old_network.eval()
-        if self.relational_kernel_teacher is not None:
-            self.relational_kernel_teacher.eval()
+        if self.kernel is not None and not any(
+            parameter.requires_grad for parameter in self.kernel.parameters()
+        ):
+            self.kernel.eval()
         return self
 
     def forward(
@@ -123,8 +118,7 @@ class StepModule(nn.Module):
         for component in (
             self.rs_loss,
             self.aligner,
-            self.relational_kernel,
-            self.orth_kernel,
+            self.kernel,
             self.old_projector,
         ):
             if component is not None:
@@ -140,11 +134,18 @@ class StepModule(nn.Module):
             raise RuntimeError("lambda_rs is non-zero but StepModule has no RS loss")
         if self.rs_loss is not None and lambda_rs:
             rs_features, rs_labels = self._gather_pairs(features, labels)
-            if getattr(self.rs_loss, "requires_full_precision", False):
+            if (
+                getattr(self.rs_loss, "requires_full_precision", False)
+                or self.kernel is not None
+            ):
                 with full_precision_context(features.device):
-                    loss_rs = float(lambda_rs) * self.rs_loss(rs_features.float(), rs_labels)
+                    loss_rs = float(lambda_rs) * self.rs_loss(
+                        rs_features.float(), rs_labels, kernel=self.kernel
+                    )
             else:
-                loss_rs = float(lambda_rs) * self.rs_loss(rs_features, rs_labels)
+                loss_rs = float(lambda_rs) * self.rs_loss(
+                    rs_features, rs_labels, kernel=self.kernel
+                )
 
         if self.old_network is not None and (beta or gamma or self.mode == "rae"):
             if old_features is None:
@@ -169,21 +170,15 @@ class StepModule(nn.Module):
                     projected_old = self.aligner(old_features)
                     loss_align = nn.functional.mse_loss(features.float(), projected_old.float())
                     if beta and lambda_qrel:
-                        if self.relational_kernel is None:
+                        if self.kernel is None:
                             raise RuntimeError(
-                                "lambda_qrel is non-zero but no relational kernel is configured"
-                            )
-                        if self.relational_kernel_teacher is None:
-                            raise RuntimeError(
-                                "lambda_qrel requires a frozen relational-kernel teacher"
+                                "lambda_qrel is non-zero but no shared kernel is configured"
                             )
                         current_global, _ = self._gather_pairs(features, labels)
                         previous_global, _ = self._gather_pairs(old_features, labels)
-                        current_kernel = self.relational_kernel(current_global.float())
+                        current_kernel = self.kernel(current_global.float())
                         with torch.no_grad():
-                            previous_kernel = self.relational_kernel_teacher(
-                                previous_global.float()
-                            )
+                            previous_kernel = self.kernel(previous_global.float())
                         loss_rel = float(beta) * float(lambda_qrel) * (
                             (current_kernel - previous_kernel.detach()).square().mean()
                         )
@@ -192,13 +187,13 @@ class StepModule(nn.Module):
                             "Incremental orthogonality requires saved old prototypes"
                         )
                     if gamma:
-                        if self.orth_kernel is not None:
+                        if self.kernel is not None:
                             centering_mean = old_features.mean(dim=0, keepdim=True)
                             aligned_prototypes = self.aligner(
                                 old_prototypes.detach().float(),
                                 centering_mean=centering_mean,
                             )
-                            similarity = self.orth_kernel(
+                            similarity = self.kernel(
                                 features.float(), aligned_prototypes.float()
                             )
                             if similarity.shape[1] == 0:

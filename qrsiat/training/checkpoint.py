@@ -45,12 +45,14 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
 
 def _trainable_state_dict(module: Any) -> dict[str, Any]:
     state = module.state_dict()
-    trainable = {
+    retained = {
         name
         for name, parameter in module.named_parameters()
         if parameter.requires_grad
     }
-    return {name: value for name, value in state.items() if name in trainable}
+    if hasattr(module, "named_buffers"):
+        retained.update(name for name, _ in module.named_buffers())
+    return {name: value for name, value in state.items() if name in retained}
 
 
 class CheckpointManager:
@@ -67,6 +69,7 @@ class CheckpointManager:
         modules: dict[str, Any],
         config: dict[str, Any],
         *,
+        full_state_modules: set[str] | frozenset[str] = frozenset(),
         optimizer: Any | None = None,
         metadata: dict[str, Any] | None = None,
         rank: int = 0,
@@ -77,6 +80,12 @@ class CheckpointManager:
             return None
         if task < 0 or not modules:
             raise ValueError("task must be non-negative and modules must not be empty")
+        unknown_full_state_modules = full_state_modules - modules.keys()
+        if unknown_full_state_modules:
+            raise ValueError(
+                "full_state_modules contains unknown modules: "
+                + ", ".join(sorted(unknown_full_state_modules))
+            )
         digest = configuration_digest(config)
         payload = {
             "schema_version": 1,
@@ -84,7 +93,11 @@ class CheckpointManager:
             "config_digest": digest,
             "config": config,
             "modules": {
-                name: _trainable_state_dict(module)
+                name: (
+                    module.state_dict()
+                    if name in full_state_modules
+                    else _trainable_state_dict(module)
+                )
                 for name, module in modules.items()
                 if module is not None
             },

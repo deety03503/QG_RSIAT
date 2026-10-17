@@ -16,7 +16,7 @@ class QRsiatConfig:
     pretrained_weights: str | None = None
     kernel: str = "cosine"
     orth: str = "plain"
-    rs_kernel: str = "cosine"
+    rs_kernel: str | None = None
     orth_top_k: int = 3
     orth_temperature: float = 0.1
     orth_epsilon: float = 0.2
@@ -32,6 +32,10 @@ class QRsiatConfig:
     use_compile: bool = False
     freeze_cast: bool = False
     grad_checkpointing: bool = False
+    diagnostics: bool = False
+    input_norm: str = "none"
+    kernel_calibration: bool = False
+    kernel_target_median: float = 0.1
     probe: bool | None = None
     smoke: bool = False
     output_dir: str = "./out"
@@ -47,12 +51,13 @@ class QRsiatConfig:
             "aligner",
             "kernel",
             "orth",
-            "rs_kernel",
             "output_dir",
             "resume",
         )
         if any(not isinstance(getattr(self, name), str) for name in string_fields):
             raise ValueError("Mode, feature selectors, output_dir, and resume must be strings")
+        if self.rs_kernel is not None and not isinstance(self.rs_kernel, str):
+            raise ValueError("rs_kernel must be a string or None")
         integer_fields = (
             "n_qubits",
             "quantum_layers",
@@ -90,11 +95,22 @@ class QRsiatConfig:
             "use_compile",
             "freeze_cast",
             "grad_checkpointing",
+            "diagnostics",
+            "kernel_calibration",
             "force_resume",
             "smoke",
         )
         if any(not isinstance(getattr(self, name), bool) for name in bool_fields):
             raise ValueError("Optimization and behavior flags must be booleans")
+        if self.input_norm not in {"none", "layernorm", "l2"}:
+            raise ValueError(f"Unsupported input_norm: {self.input_norm!r}")
+        if (
+            isinstance(self.kernel_target_median, bool)
+            or not isinstance(self.kernel_target_median, (int, float))
+            or not math.isfinite(self.kernel_target_median)
+            or not (0.0 < self.kernel_target_median < 1.0)
+        ):
+            raise ValueError("kernel_target_median must be a finite float in (0, 1)")
         for name in ("pair_gather", "probe"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, bool):
@@ -120,8 +136,14 @@ class QRsiatConfig:
             raise ValueError(f"Unsupported kernel: {self.kernel!r}")
         if self.orth not in {"plain", "qweighted"}:
             raise ValueError(f"Unsupported orth mode: {self.orth!r}")
-        if self.rs_kernel not in {"cosine", "quantum"}:
+        if self.rs_kernel is not None and self.rs_kernel not in {
+            "quantum", "cosine", "rbf", "mlp"
+        }:
             raise ValueError(f"Unsupported RS kernel: {self.rs_kernel!r}")
+        if self.rs_kernel is not None and self.rs_kernel != self.kernel:
+            raise ValueError(
+                "The shared kernel requires kernel and rs_kernel to have the same value"
+            )
         if self.lambda_qrel < 0:
             raise ValueError("lambda_qrel must be non-negative")
         if self.orth_top_k < 1:
@@ -134,6 +156,8 @@ class QRsiatConfig:
             raise ValueError("lambda_qrel > 0 requires --aligner qhybrid")
         if self.orth == "qweighted" and self.aligner != "qhybrid":
             raise ValueError("--orth qweighted requires --aligner qhybrid")
+        if self.orth == "qweighted" and self.kernel != "quantum":
+            raise ValueError("--orth qweighted requires --kernel quantum")
         if self.n_qubits not in {4, 8, 12}:
             raise ValueError("n_qubits must be one of 4, 8, or 12")
         if self.quantum_layers not in {1, 2, 3}:

@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import time
 from dataclasses import replace
@@ -19,7 +20,15 @@ from utils.loss import AngularPenaltySMLoss
 from utils.toolkit import AutoencoderSigmoid
 from qrsiat.quantum.aligner import QHybridAligner
 from qrsiat.quantum.kernels import PairwiseKernel
+from qrsiat.quantum.feature_map import calibrate_bandwidth
+from qrsiat.quantum.diagnostics import kernel_diagnostics
+from qrsiat.runtime.precision import full_precision_context
 from qrsiat.training.step_module import StepModule
+from qrsiat.training.diagnostics import (
+    accumulate_float64,
+    diagnostics_due,
+    rt_loss_components,
+)
 from qrsiat.training.schedule import warmup_value
 from torch.utils.data.distributed import DistributedSampler
 from qrsiat.distributed.samplers import DistributedEvalSampler
@@ -68,36 +77,24 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         self.tuned_epochs = None
         self.aligner_mode = args.get("aligner", "rae")
         self.qhybrid = None
-        self.relational_kernel = None
-        self.relational_kernel_teacher = None
-        self.orth_kernel = None
-        self.rs_kernel = None
+        kernel_name = args.get("kernel", "cosine")
+        rs_kernel_name = args.get("rs_kernel") or kernel_name
+        if rs_kernel_name != kernel_name:
+            raise ValueError(
+                "The shared kernel requires 'kernel' and 'rs_kernel' to match"
+            )
+        if args.get("orth", "plain") == "qweighted" and kernel_name != "quantum":
+            raise ValueError("--orth qweighted requires the shared kernel to be quantum")
+        self.kernel = PairwiseKernel(
+            kernel_name,
+            n_qubits=args.get("n_qubits", 8),
+            layers=args.get("quantum_layers", 2),
+            centering=args.get("quantum_centering", True),
+            cycle=args.get("cycle", False),
+            input_norm=args.get("input_norm", "none"),
+        )
         if self.aligner_mode == "qhybrid":
             self.qhybrid = QHybridAligner(
-                n_qubits=args.get("n_qubits", 8),
-                layers=args.get("quantum_layers", 2),
-                centering=args.get("quantum_centering", True),
-                cycle=args.get("cycle", False),
-            )
-        if args.get("lambda_qrel", 0.0) > 0:
-            self.relational_kernel = PairwiseKernel(
-                args.get("kernel", "cosine"),
-                n_qubits=args.get("n_qubits", 8),
-                layers=args.get("quantum_layers", 2),
-                centering=args.get("quantum_centering", True),
-                cycle=args.get("cycle", False),
-            )
-        if args.get("orth", "plain") == "qweighted":
-            self.orth_kernel = PairwiseKernel(
-                "quantum",
-                n_qubits=args.get("n_qubits", 8),
-                layers=args.get("quantum_layers", 2),
-                centering=args.get("quantum_centering", True),
-                cycle=args.get("cycle", False),
-            )
-        if args.get("rs_kernel", "cosine") == "quantum":
-            self.rs_kernel = PairwiseKernel(
-                "quantum",
                 n_qubits=args.get("n_qubits", 8),
                 layers=args.get("quantum_layers", 2),
                 centering=args.get("quantum_centering", True),
@@ -106,7 +103,6 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         self.rs_loss_func = RS_Loss(
             self.args["alpha"],
             self.args["rs_margin"],
-            kernel=self.rs_kernel,
         )
         self.loss_cos = AngularPenaltySMLoss(
             loss_type="cosface",
@@ -118,6 +114,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         self._step_module = None
         self._training_module = None
         self._batch_probe_completed = False
+        self._last_components = {}
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -159,8 +156,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             self.old_ae = AutoencoderSigmoid(input_dims=768, code_dims=self.args["ae_code_dims"])
             self.old_ae.to(self._device)
         if self._cur_task > 0 and self.aligner_mode == "qhybrid":
-            # Each task aligns against a different frozen previous network, so
-            # start the complete aligner afresh from its identity initialization.
+            # Each task has a different teacher, so restart the near-identity aligner.
             self.qhybrid = QHybridAligner(
                 n_qubits=self.args.get("n_qubits", 8),
                 layers=self.args.get("quantum_layers", 2),
@@ -169,18 +165,10 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             ).to(self._device)
         elif self.qhybrid is not None:
             self.qhybrid.to(self._device)
-        if self.relational_kernel is not None:
-            self.relational_kernel.to(self._device)
-            if self._cur_task > 0:
-                # Freeze the previous task's kernel as a stable target for this task.
-                self.relational_kernel_teacher = copy.deepcopy(self.relational_kernel)
-                self.relational_kernel_teacher.to(self._device)
-                self.relational_kernel_teacher.requires_grad_(False)
-                self.relational_kernel_teacher.eval()
-        if self.orth_kernel is not None:
-            self.orth_kernel.to(self._device)
-        if self.rs_kernel is not None:
-            self.rs_kernel.to(self._device)
+        self.kernel.to(self._device)
+        if self._cur_task > 0:
+            self.kernel.requires_grad_(False)
+            self.kernel.eval()
             
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         # self._network.update_fc(data_manager.get_task_size(self._cur_task)*4)
@@ -238,6 +226,39 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             if plan is not None
             else DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8)
         )
+
+        if self.args.get("diagnostics", False) and self._is_diagnostics_rank():
+            diagnostics_dataset = data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="train",
+                mode="test",
+            )
+            diagnostics_loader = DataLoader(
+                diagnostics_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=0,
+                generator=torch.Generator().manual_seed(
+                    int(self.args.get("seed", 1993)) + self._cur_task
+                ),
+            )
+            _, diagnostic_images, diagnostic_labels = next(iter(diagnostics_loader))
+            self._diagnostic_batch = (
+                diagnostic_images.to(self._device),
+                diagnostic_labels.to(self._device),
+            )
+            reference_network = (
+                self.old_network_module_ptr
+                if self._cur_task > 0 else self._network
+            )
+            self._diagnostic_reference_features = self._features_for_diagnostics(
+                self._diagnostic_batch[0], reference_network
+            )
+        else:
+            self._diagnostic_batch = None
+            self._diagnostic_reference_features = None
+
+        self._maybe_calibrate_kernel(data_manager)
 
         feature_loader = None
         if self._cur_task >0:
@@ -311,9 +332,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             rs_loss=self.rs_loss_func if self._cur_task == 0 else None,
             old_network=old_network,
             aligner=self.qhybrid,
-            relational_kernel=self.relational_kernel,
-            relational_kernel_teacher=self.relational_kernel_teacher,
-            orth_kernel=self.orth_kernel,
+            kernel=self.kernel,
             old_projector=self.old_ae,
             mode=self.aligner_mode,
             device=self._device,
@@ -414,18 +433,14 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         modules = {"network": self._network}
         if self.qhybrid is not None:
             modules["qhybrid"] = self.qhybrid
-        if self.relational_kernel is not None:
-            modules["relational_kernel"] = self.relational_kernel
-        if self.orth_kernel is not None:
-            modules["orth_kernel"] = self.orth_kernel
-        if self.rs_kernel is not None:
-            modules["rs_kernel"] = self.rs_kernel
+        modules["kernel"] = self.kernel
         if self.old_ae is not None:
             modules["old_ae"] = self.old_ae
         manager.save(
             self._cur_task,
             modules,
             self.args.get("checkpoint_config", {}),
+            full_state_modules={"kernel"},
             metadata={
                 "known_classes": self._known_classes,
                 "total_classes": self._total_classes,
@@ -484,7 +499,39 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 input_dims=768, code_dims=self.args["ae_code_dims"]
             ).to(self._device)
         modules = {"network": self._network}
-        for name in ("qhybrid", "relational_kernel", "orth_kernel", "rs_kernel", "old_ae"):
+        saved_modules = payload.get("modules")
+        if isinstance(saved_modules, dict) and "kernel" not in saved_modules:
+            legacy_kernel = saved_modules.get("rs_kernel")
+            if legacy_kernel is None and any(
+                parameter.requires_grad for parameter in self.kernel.parameters()
+            ):
+                raise ValueError(
+                    "This legacy checkpoint has no base-task RS kernel to restore. "
+                    "Start a new run to train the shared kernel on the base task."
+                )
+            if legacy_kernel is not None:
+                expected_state = self.kernel.state_dict()
+                unexpected_keys = set(legacy_kernel) - set(expected_state)
+                incompatible_shapes = [
+                    name
+                    for name, value in legacy_kernel.items()
+                    if name in expected_state
+                    and tuple(value.shape) != tuple(expected_state[name].shape)
+                ]
+                if unexpected_keys or incompatible_shapes:
+                    raise ValueError(
+                        "The legacy RS kernel architecture does not match the "
+                        "configured shared kernel; start a new run."
+                    )
+            payload = dict(payload)
+            payload["modules"] = {
+                name: state
+                for name, state in saved_modules.items()
+                if name not in {"relational_kernel", "orth_kernel", "rs_kernel"}
+            }
+            payload["modules"]["kernel"] = legacy_kernel or {}
+            logging.info("Migrating the legacy base-task RS kernel to the shared kernel.")
+        for name in ("qhybrid", "kernel", "old_ae"):
             module = getattr(self, name, None)
             if module is not None:
                 modules[name] = module
@@ -632,14 +679,21 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             grad_accum_steps = 1
         
         for _, epoch in enumerate(prog_bar):
+            epoch_started = time.perf_counter()
             self._network.train()
             self._training_module.train()
             sampler = getattr(train_loader, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
-            losses = 0.0
-            losses_c, losses_rt = 0.0, 0.0
-            correct, total = 0, 0
+            losses = torch.zeros((), dtype=torch.float64, device=self._device)
+            losses_c = torch.zeros_like(losses)
+            losses_rt = torch.zeros_like(losses)
+            component_sums = {
+                name: torch.zeros_like(losses)
+                for name in ("loss_rs", "loss_rel", "loss_align", "loss_orth")
+            }
+            correct = torch.zeros((), dtype=torch.long, device=self._device)
+            total = 0
             optimizer.zero_grad()
             step_count = 0
 
@@ -684,32 +738,65 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                         scaler.step(optimizer)
                         scaler.update()
                     optimizer.zero_grad()
-                losses += loss.item()
-                losses_c += loss_c.item()
-                losses_rt += loss_rt.item()
+                accumulate_float64(losses, loss)
+                accumulate_float64(losses_c, loss_c)
+                accumulate_float64(losses_rt, loss_rt)
+                for name in component_sums:
+                    accumulate_float64(component_sums[name], self._last_components[name])
                 _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                correct.add_(preds.eq(targets.expand_as(preds)).sum())
                 total += len(targets)
                 step_count += 1
             if step_count == 0:
                 raise RuntimeError("Training loader yielded no batches")
+            epoch_values = torch.stack(
+                (losses, losses_c, losses_rt, *component_sums.values(), correct.to(torch.float64))
+            ).cpu().tolist()
             train_speed = total / max(time.perf_counter() - training_started, 1e-9)
             scheduler.step()
 
-            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+            losses_value, losses_c_value, losses_rt_value = epoch_values[:3]
+            component_values = dict(zip(component_sums, epoch_values[3:7]))
+            correct_value = int(epoch_values[7])
+            train_acc = np.around(correct_value * 100 / total, decimals=2)
+
+            diagnostic_elapsed = 0.0
+            diagnostic_record = None
+            if self._should_write_diagnostics(epoch):
+                if self._device.type == "cuda":
+                    torch.cuda.synchronize(self._device)
+                diagnostic_started = time.perf_counter()
+                diagnostic_record = self._collect_diagnostics(epoch, warmup_epoch)
+                if self._device.type == "cuda":
+                    torch.cuda.synchronize(self._device)
+                diagnostic_elapsed = time.perf_counter() - diagnostic_started
+                diagnostic_record["diagnostics_seconds"] = diagnostic_elapsed
             test_acc = self._compute_accuracy(self._network, test_loader)
+            if diagnostic_record is not None:
+                diagnostic_record["diagnostics_epoch_fraction"] = diagnostic_elapsed / max(
+                    time.perf_counter() - epoch_started, 1e-9
+                )
+                self._append_diagnostic_record(diagnostic_record)
             info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
                 self._cur_task,
                 epoch + 1,
                 self.tuned_epochs,
-                losses / step_count,
-                losses_c/step_count,
-                losses_rt/step_count,
+                losses_value / step_count,
+                losses_c_value / step_count,
+                losses_rt_value / step_count,
                 train_acc,
                 test_acc,
             )
             prog_bar.set_description(info)
             prog_bar.set_postfix(speed=f"{train_speed:.1f} samples/s")
+            if component_values:
+                component_info = "Task {}, Epoch {}/{} => Loss_rs {:.6g}, Loss_rel {:.6g}, Loss_align {:.6g}, Loss_orth {:.6g}".format(
+                    self._cur_task,
+                    epoch + 1,
+                    self.tuned_epochs,
+                    *(component_values[name] / step_count for name in component_sums),
+                )
+                logging.info(component_info)
         logging.info(info)
 
     def _inc_loss(self, features, features_old):
@@ -723,7 +810,14 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         loss_orth = similarity.sum() / (similarity.shape[0]*similarity.shape[1])
         return self.args["beta"] * loss_align + self.args["gamma"] * loss_orth
         
-    def _compute_rt_loss(self, inputs, targets, epoch=None, warmup_epoch=10):     
+    def _compute_rt_loss(self, inputs, targets, epoch=None, warmup_epoch=10):
+        output, beta = self._forward_training_step(
+            inputs, targets, epoch, warmup_epoch, self._training_module
+        )
+        loss_rt, self._last_components = rt_loss_components(output, beta)
+        return output["logits"], output["loss_cls"], loss_rt
+
+    def _forward_training_step(self, inputs, targets, epoch, warmup_epoch, module):
         if self._training_module is None:
             raise RuntimeError("Training StepModule was not initialized for this task")
         if self._cur_task == 0:
@@ -749,7 +843,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         context = self.args.get("runtime_context")
         autocast = context.autocast() if context is not None else torch.autocast("cpu", enabled=False)
         with autocast:
-            output = self._training_module(
+            output = module(
                 inputs,
                 targets,
                 class_start=self._known_classes,
@@ -763,10 +857,301 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 temperature=self.args.get("orth_temperature", 0.1),
                 orth_epsilon=self.args.get("orth_epsilon", 0.2),
             )
-        return output["logits"], output["loss_cls"], (
-            output["loss_rs"] + output["loss_rel"] + output["loss_align"] * beta
-            + output["loss_orth"]
+        return output, beta
+
+    def _is_diagnostics_rank(self):
+        context = self.args.get("runtime_context")
+        return context is None or context.is_main
+
+    def _should_write_diagnostics(self, epoch):
+        return diagnostics_due(
+            self.args.get("diagnostics", False),
+            self._is_diagnostics_rank(),
+            epoch,
+            self.tuned_epochs,
         )
+
+    def _maybe_calibrate_kernel(self, data_manager):
+        if not self.args.get("kernel_calibration", False):
+            return
+        if self.kernel is None or self.kernel.quantum is None:
+            return
+        context = self.args.get("runtime_context")
+        if context is not None and not context.is_main:
+            return
+        calib_dataset = data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes),
+            source="train",
+            mode="test",
+        )
+        calib_loader = DataLoader(
+            calib_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0,
+            generator=torch.Generator().manual_seed(
+                int(self.args.get("seed", 1993)) + self._cur_task
+            ),
+        )
+        all_features = []
+        all_labels = []
+        network = self.old_network_module_ptr if self._cur_task > 0 else self._network
+        was_training = network.training
+        network.eval()
+        try:
+            with torch.no_grad(), full_precision_context(self._device):
+                for step, (_, images, labels) in enumerate(calib_loader):
+                    if step >= 2:
+                        break
+                    images = images.to(self._device)
+                    feats = network.extract_vector(images)
+                    all_features.append(feats.float())
+                    all_labels.append(labels.to(self._device))
+        finally:
+            network.train(was_training)
+        if not all_features:
+            return
+        feats = torch.cat(all_features, dim=0)
+        labels = torch.cat(all_labels, dim=0)
+        target = float(self.args.get("kernel_target_median", 0.1))
+        best_gamma = calibrate_bandwidth(
+            self.kernel.quantum, feats, labels=labels, target=target
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(self.kernel.quantum.bandwidth, src=0)
+        from qrsiat.quantum.simulator import fidelity_kernel
+        with torch.no_grad(), full_precision_context(self._device):
+            state, _ = self.kernel.quantum(feats)
+            k = fidelity_kernel(state)
+            n = feats.shape[0]
+            mask = ~torch.eye(n, dtype=torch.bool, device=feats.device)
+            diff_mask = mask & (labels[:, None] != labels[None, :])
+            if bool(diff_mask.any()):
+                mask = diff_mask
+            med_f = k[mask].median().item() if bool(mask.any()) else 0.0
+        logging.info(
+            "Task {} Kernel Bandwidth Calibration: gamma={:.6g}, median_F={:.4f} (target={:.4f})".format(
+                self._cur_task, best_gamma, med_f, target
+            )
+        )
+
+    def _features_for_diagnostics(self, images, network=None):
+        network = self._network if network is None else network
+        was_training = network.training
+        network.eval()
+        context = self.args.get("runtime_context")
+        autocast = context.autocast() if context is not None else torch.autocast("cpu", enabled=False)
+        try:
+            with torch.no_grad(), autocast:
+                features = network.extract_vector(images).detach().float()
+        finally:
+            network.train(was_training)
+        return features
+
+    def _collect_diagnostics(self, epoch, warmup_epoch):
+        images, labels = self._diagnostic_batch
+        was_training = self._network.training
+        self._network.eval()
+        self._step_module.eval()
+        try:
+            output, beta = self._forward_training_step(
+                images, labels, epoch, warmup_epoch, self._step_module
+            )
+            features = output["features"].float()
+            centered = features - features.mean(dim=0, keepdim=True)
+            normalized = F.normalize(features, dim=1)
+            normalized_centered = normalized - normalized.mean(dim=0, keepdim=True)
+            result = {
+                "task": int(self._cur_task),
+                "epoch": int(epoch + 1),
+                "feature_rms_raw_centered": centered.square().mean().sqrt().item(),
+                "feature_rms_normalized_centered": normalized_centered.square().mean().sqrt().item(),
+            }
+            result.update(self._quantum_input_stats(features, normalized))
+
+            rs_features = features if getattr(self.kernel, "input_norm", "none") != "none" else normalized
+            rs_matrix = self.kernel(rs_features)
+            qrel_matrix = self.kernel(features)
+            result["kernel_rs"] = kernel_diagnostics(rs_matrix, labels)
+            result["kernel_qrel"] = kernel_diagnostics(qrel_matrix, labels)
+            result.update(self._qorth_diagnostics(features))
+            result.update(self._quantum_parameter_norms())
+            result["bandwidth"] = (
+                float(self.kernel.quantum.bandwidth.item())
+                if self.kernel.quantum is not None
+                else None
+            )
+            current_features = features.detach()
+            reference = self._diagnostic_reference_features
+            result["feature_drift_from_previous_task"] = (
+                (current_features - reference).norm()
+                / (reference.norm() + 1e-12)
+            ).item()
+            result["gradient_diagnostics"] = self._loss_gradient_diagnostics(
+                output["loss_cls"],
+                {
+                    "loss_rs": output["loss_rs"],
+                    "loss_rel": output["loss_rel"],
+                    "loss_align": output["loss_align"] * beta,
+                    "loss_orth": output["loss_orth"],
+                },
+            )
+            return result
+        finally:
+            self._network.train(was_training)
+            self._step_module.train(was_training)
+
+    def _quantum_input_stats(self, features, normalized):
+        stats = {}
+        quantum = self.kernel.quantum
+        if quantum is None:
+            stats.update({
+                "sigma_u_raw": None,
+                "tanh_saturation_raw": None,
+                "sigma_u_normalized": None,
+                "tanh_saturation_normalized": None,
+            })
+            return stats
+        for name, values in (("raw", features), ("normalized", normalized)):
+            if quantum.centering:
+                values = values - values.mean(dim=0, keepdim=True)
+            with torch.no_grad():
+                pre_tanh = quantum.project(values.float())
+                stats[f"sigma_u_{name}"] = pre_tanh.std(unbiased=False).item()
+                stats[f"tanh_saturation_{name}"] = (
+                    pre_tanh.tanh().abs() > 0.99
+                ).float().mean().item()
+        return stats
+
+    def _qorth_diagnostics(self, features):
+        result = {
+            "qorth_G_topk": [],
+            "qorth_top1_gt_epsilon_probability": None,
+            "aligned_prototype_distance": None,
+        }
+        if self._cur_task == 0 or self._class_means is None:
+            return result
+        prototypes = torch.as_tensor(
+            self._class_means[: self._known_classes],
+            dtype=torch.float32,
+            device=features.device,
+        )
+        if self.aligner_mode == "qhybrid" and self.qhybrid is not None:
+            with torch.no_grad():
+                old_features = self._features_for_diagnostics(
+                    self._diagnostic_batch[0], self.old_network_module_ptr
+                )
+                mean = old_features.mean(dim=0, keepdim=True)
+                aligned = self.qhybrid(prototypes, centering_mean=mean)
+            similarity = self.kernel(features, aligned)
+        elif self.old_ae is not None:
+            with torch.no_grad():
+                old_features = self._features_for_diagnostics(
+                    self._diagnostic_batch[0], self.old_network_module_ptr
+                )
+                projected_features = self.old_ae(old_features)
+                aligned = self.old_ae(prototypes)
+                similarity = (
+                    F.normalize(aligned, dim=1)
+                    @ F.normalize(projected_features, dim=1).transpose(0, 1)
+                ).transpose(0, 1)
+        else:
+            return result
+        if aligned.shape == prototypes.shape:
+            result["aligned_prototype_distance"] = (
+                (aligned - prototypes).norm(dim=1).mean().item()
+            )
+        if similarity.shape[1] == 0:
+            return result
+        k = min(int(self.args.get("orth_top_k", 3)), similarity.shape[1])
+        values = similarity.topk(k, dim=1).values
+        result["qorth_G_topk"] = values.detach().cpu().tolist()
+        epsilon = float(self.args.get("orth_epsilon", 0.2))
+        result["qorth_top1_gt_epsilon_probability"] = (
+            (values[:, 0] > epsilon).float().mean().item()
+        )
+        return result
+
+    def _quantum_parameter_norms(self):
+        quantum = self.kernel.quantum
+        aligner = self.qhybrid
+        return {
+            "W_q_fro": (
+                quantum.project.weight.detach().float().norm().item()
+                if quantum is not None else None
+            ),
+            "theta_norm": (
+                quantum.theta.detach().float().norm().item()
+                if quantum is not None else None
+            ),
+            "theta_aligner_norm": (
+                aligner.theta.detach().float().norm().item()
+                if aligner is not None else None
+            ),
+            "W_q_aligner_fro": (
+                aligner.down.weight.detach().float().norm().item()
+                if aligner is not None else None
+            ),
+            "W_up_fro": (
+                aligner.up.weight.detach().float().norm().item()
+                if aligner is not None else None
+            ),
+        }
+
+    def _loss_gradient_diagnostics(self, classification_loss, components):
+        parameters = [
+            parameter for parameter in self._network.convnet.parameters()
+            if parameter.requires_grad
+        ]
+        if not parameters:
+            return {}
+        losses = {"loss_cls": classification_loss, **components}
+        gradients = {}
+        for index, (name, loss) in enumerate(losses.items()):
+            grads = torch.autograd.grad(
+                loss,
+                parameters,
+                retain_graph=index < len(losses) - 1,
+                allow_unused=True,
+            )
+            gradients[name] = grads
+        base = gradients["loss_cls"]
+        base_norm = self._gradient_norm(base, parameters[0].device)
+        result = {}
+        for name, grads in gradients.items():
+            norm = self._gradient_norm(grads, parameters[0].device)
+            dot = sum(
+                (left.float() * right.float()).sum()
+                for left, right in zip(base, grads)
+                if left is not None and right is not None
+            )
+            result[name] = {
+                "norm": norm.item(),
+                "norm_ratio_to_loss_cls": (norm / (base_norm + 1e-12)).item(),
+                "cosine_to_loss_cls": (
+                    (dot / (base_norm * norm + 1e-12)).item()
+                    if name != "loss_cls" else 1.0
+                ),
+            }
+        return result
+
+    @staticmethod
+    def _gradient_norm(gradients, device=None):
+        squared = [gradient.float().square().sum() for gradient in gradients if gradient is not None]
+        if not squared:
+            return torch.zeros((), dtype=torch.float32, device=device)
+        return torch.stack(squared).sum().sqrt()
+
+    def _append_diagnostic_record(self, record):
+        output_dir = Path(self.args.get("output_dir", "./out"))
+        seed = self.args.get("seed", 1993)
+        if isinstance(seed, (list, tuple)):
+            seed = seed[0]
+        path = output_dir / self.args["dataset"] / f"seed_{seed}" / "diagnostics.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, allow_nan=False) + "\n")
+            stream.flush()
     
 class RS_Loss(nn.Module):
     def __init__(self, lamda=0.5, margin=0.5, kernel=None):
@@ -776,18 +1161,23 @@ class RS_Loss(nn.Module):
         self.kernel = kernel
         self.requires_full_precision = kernel is not None
 
-    def forward(self, features, labels):
+    def forward(self, features, labels, *, kernel=None):
         device = features.device
-        features = F.normalize(features, p=2, dim=1)
+        pairwise_kernel = self.kernel if kernel is None else kernel
+        input_norm = getattr(pairwise_kernel, "input_norm", "none") if pairwise_kernel is not None else "none"
+        if pairwise_kernel is not None and input_norm != "none":
+            kernel_features = features.float()
+        else:
+            kernel_features = F.normalize(features, p=2, dim=1).float()
         labels = labels[:, None]
         mask = torch.eq(labels, labels.t()).float().to(device)
         eye = torch.eye(mask.size(0), device=device)
         mask_pos = mask - eye
         mask_neg = 1.0 - mask
         dot_prod = (
-            self.kernel(features.float())
-            if self.kernel is not None
-            else torch.matmul(features, features.t())
+            pairwise_kernel(kernel_features)
+            if pairwise_kernel is not None
+            else torch.matmul(kernel_features, kernel_features.t())
         )
 
         pos_loss = F.relu(1.0 - dot_prod) * mask_pos

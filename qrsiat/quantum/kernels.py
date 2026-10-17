@@ -18,18 +18,27 @@ class PairwiseKernel(nn.Module):
         centering: bool = True,
         cycle: bool = False,
         hidden_dim: int | None = None,
+        input_norm: str = "none",
     ) -> None:
         super().__init__()
         if name not in {"quantum", "cosine", "rbf", "mlp"}:
             raise ValueError(f"Unsupported kernel {name!r}")
+        if input_norm not in {"none", "layernorm", "l2"}:
+            raise ValueError(f"Unsupported input_norm: {input_norm!r}")
         self.name = name
+        self.input_norm = input_norm
         self.quantum = None
         self.projector = None
         if name == "quantum":
             from .feature_map import QuantumFeatureMap
 
             self.quantum = QuantumFeatureMap(
-                input_dim, n_qubits, layers, centering=centering, cycle=cycle
+                input_dim,
+                n_qubits,
+                layers,
+                centering=centering,
+                cycle=cycle,
+                input_norm=input_norm,
             )
         elif name == "mlp":
             width = hidden_dim or input_dim
@@ -42,6 +51,17 @@ class PairwiseKernel(nn.Module):
             import torch
 
             self.register_buffer("gamma", torch.tensor(1.0 / input_dim))
+
+    def normalize_input(self, features: Any) -> Any:
+        import math
+        import torch.nn.functional as functional
+
+        values = features.float()
+        if self.input_norm == "layernorm":
+            return functional.layer_norm(values, (values.shape[-1],))
+        if self.input_norm == "l2":
+            return functional.normalize(values, p=2, dim=-1) * math.sqrt(values.shape[-1])
+        return values
 
     def __call__(self, features: Any, other: Any | None = None) -> Any:
         return super().__call__(features, other)
@@ -64,9 +84,11 @@ class PairwiseKernel(nn.Module):
             else:
                 centering_mean = None
                 if self.quantum.centering:
+                    left_normed = self.quantum.normalize_input(features)
+                    right_normed = self.quantum.normalize_input(right)
                     centering_mean = (
-                        features.float().mean(dim=0, keepdim=True)
-                        + right.float().mean(dim=0, keepdim=True)
+                        left_normed.mean(dim=0, keepdim=True)
+                        + right_normed.mean(dim=0, keepdim=True)
                     ) / 2.0
                 states, _ = self.quantum(
                     features, centering_mean=centering_mean
@@ -75,6 +97,9 @@ class PairwiseKernel(nn.Module):
                     right, centering_mean=centering_mean
                 )[0]
             return fidelity_kernel(states, right_states)
+        if self.input_norm != "none":
+            features = self.normalize_input(features)
+            right = features if other is None else self.normalize_input(right)
         if self.projector is not None:
             features = self.projector(features)
             right = features if other is None else self.projector(right)
