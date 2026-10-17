@@ -27,7 +27,7 @@ class QHybridAligner(nn.Module):
         self.circuit = RealStatevectorCircuit(n_qubits, layers, cycle=cycle)
         self.theta = nn.Parameter(torch.zeros(layers, n_qubits))
         self.up = nn.Linear(2 * n_qubits, input_dim, bias=False)
-        nn.init.zeros_(self.up.weight)
+        nn.init.normal_(self.up.weight, mean=0.0, std=1e-2)
         self.centering = centering
         self.n_qubits = n_qubits
         self.layers = layers
