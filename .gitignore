@@ -38,3 +38,4 @@ data/datasets/
 logs/
 outputs/
 out/
+*.md
