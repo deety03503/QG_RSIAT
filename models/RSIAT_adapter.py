@@ -2,7 +2,6 @@ import copy
 import json
 import logging
 import time
-from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 import numpy as np
@@ -23,7 +22,12 @@ from qrsiat.quantum.aligner import QHybridAligner
 from qrsiat.quantum.kernels import PairwiseKernel
 from qrsiat.training.step_module import StepModule
 from qrsiat.training.schedule import warmup_value
-from qrsiat.training.diagnostics import gradient_diagnostics, kernel_diagnostics
+from qrsiat.training.diagnostics import (
+    accumulate_step_metrics,
+    create_epoch_metric_accumulator,
+    gradient_diagnostics,
+    kernel_diagnostics,
+)
 from torch.utils.data.distributed import DistributedSampler
 from qrsiat.distributed.samplers import DistributedEvalSampler
 from qrsiat.data.loaders import create_data_loader
@@ -475,6 +479,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             if self._cur_task > 0 and self.old_network_module_ptr is not None:
                 with torch.inference_mode():
                     old_features = self.old_network_module_ptr.extract_vector(images).float()
+                old_features = old_features.detach().clone()
             _, _, _, output, components = self._compute_rt_loss(
                 images,
                 labels,
@@ -845,7 +850,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 sampler.set_epoch(epoch)
             # float64 mirrors Python's old per-step ``.item()`` accumulation
             # while keeping the reduction on the device until epoch end.
-            loss_sums = torch.zeros(8, device=self._device, dtype=torch.float64)
+            loss_sums = create_epoch_metric_accumulator(self._device)
             total = 0
             optimizer.zero_grad()
             step_count = 0
@@ -896,14 +901,13 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                     optimizer.zero_grad()
                 _, preds = torch.max(logits, dim=1)
                 correct = preds.eq(targets.expand_as(preds)).sum()
-                loss_sums += torch.stack(
-                    [
-                        loss.detach().to(torch.float64),
-                        loss_c.detach().to(torch.float64),
-                        loss_rt.detach().to(torch.float64),
-                        *self._last_loss_components.to(torch.float64),
-                        correct.detach().to(torch.float64),
-                    ]
+                loss_sums = accumulate_step_metrics(
+                    loss_sums,
+                    loss,
+                    loss_c,
+                    loss_rt,
+                    self._last_loss_components,
+                    correct,
                 )
                 total += len(targets)
                 step_count += 1
@@ -918,25 +922,53 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
              orth_sum, correct_sum) = loss_sums.detach().cpu().tolist()
             train_acc = np.around(correct_sum * 100 / total, decimals=2)
             test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-                self._cur_task,
-                epoch + 1,
-                self.tuned_epochs,
-                loss_sum / step_count,
-                loss_c_sum / step_count,
-                loss_rt_sum / step_count,
-                train_acc,
-                test_acc,
+            metrics = {
+                "loss": loss_sum / step_count,
+                "loss_c": loss_c_sum / step_count,
+                "Losses_rt": loss_rt_sum / step_count,
+                "l_rs": rs_sum / step_count,
+                "l_qrel": rel_sum / step_count,
+                "l_align": align_sum / step_count,
+                "l_orth": orth_sum / step_count,
+                "train_acc": train_acc,
+                "test_acc": test_acc,
+                "speed": train_speed,
+            }
+            prog_bar.set_description(f"Task {self._cur_task}")
+            prog_bar.set_postfix(
+                loss=f"{metrics['loss']:.3f}",
+                loss_c=f"{metrics['loss_c']:.3f}",
+                l_rs=f"{metrics['l_rs']:.5f}",
+                l_qrel=f"{metrics['l_qrel']:.5f}",
+                l_align=f"{metrics['l_align']:.5f}",
+                l_orth=f"{metrics['l_orth']:.5f}",
+                train_acc=f"{metrics['train_acc']:.2f}",
+                test_acc=f"{metrics['test_acc']:.2f}",
+                speed=f"{metrics['speed']:.1f} samples/s",
             )
-            prog_bar.set_description(info)
-            prog_bar.set_postfix(speed=f"{train_speed:.1f} samples/s")
-            logging.info(info)
+            meter = prog_bar.format_meter(
+                epoch,
+                self.tuned_epochs,
+                time.perf_counter() - training_started,
+                postfix=f"speed={train_speed:.1f} samples/s",
+                ncols=80,
+            )
             logging.info(
-                "Losses_rt_components => RS %.6f, qrel %.6f, align %.6f, orth %.6f",
-                rs_sum / step_count,
-                rel_sum / step_count,
-                align_sum / step_count,
-                orth_sum / step_count,
+                "Task %d %s loss %.3f, loss_c %.3f, Losses_rt %.3f, "
+                "l_rs %.6f, l_qrel %.6f, l_align %.6f, l_orth %.6f, "
+                "train_acc %.2f, test_acc %.2f, speed %.1f samples/s",
+                self._cur_task,
+                meter,
+                metrics["loss"],
+                metrics["loss_c"],
+                metrics["Losses_rt"],
+                metrics["l_rs"],
+                metrics["l_qrel"],
+                metrics["l_align"],
+                metrics["l_orth"],
+                metrics["train_acc"],
+                metrics["test_acc"],
+                metrics["speed"],
             )
             if self.args.get("diagnostics", False) and epoch + 1 == self.tuned_epochs:
                 self._run_diagnostics("epoch_end", epoch, warmup_epoch)
@@ -996,20 +1028,20 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         try:
             with autocast:
                 output = active_module(
-                inputs,
-                targets,
-                class_start=self._known_classes,
-                classification_loss=self.loss_cos,
-                old_features=old_features,
-                old_prototypes=prototypes,
-                lambda_rs=lambda_rs,
-                beta=beta,
-                gamma=gamma,
-                lambda_qrel=self.args.get("lambda_qrel", 0.0),
-                top_k=self.args.get("orth_top_k", 3),
-                temperature=self.args.get("orth_temperature", 0.1),
-                orth_epsilon=self.args.get("orth_epsilon", 0.2),
-            )
+                    inputs,
+                    targets,
+                    class_start=self._known_classes,
+                    classification_loss=self.loss_cos,
+                    old_features=old_features,
+                    old_prototypes=prototypes,
+                    lambda_rs=lambda_rs,
+                    beta=beta,
+                    gamma=gamma,
+                    lambda_qrel=self.args.get("lambda_qrel", 0.0),
+                    top_k=self.args.get("orth_top_k", 3),
+                    temperature=self.args.get("orth_temperature", 0.1),
+                    orth_epsilon=self.args.get("orth_epsilon", 0.2),
+                )
         finally:
             if original_pair_gather is not None:
                 active_module.pair_gather = original_pair_gather

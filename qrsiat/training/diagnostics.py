@@ -23,7 +23,7 @@ def accumulate_step_metrics(
     """Add one batch without a device-to-host synchronization."""
     import torch
 
-    return accumulator + torch.stack(
+    accumulator.add_(torch.stack(
         [
             loss.detach().to(torch.float64),
             loss_cls.detach().to(torch.float64),
@@ -31,7 +31,8 @@ def accumulate_step_metrics(
             *components.detach().to(torch.float64),
             correct.detach().to(torch.float64),
         ]
-    )
+    ))
+    return accumulator
 
 
 def kernel_diagnostics(kernel: Any, labels: Any, *, prefix: str = "kernel") -> dict[str, Any]:

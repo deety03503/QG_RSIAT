@@ -56,7 +56,7 @@ def _train(args):
         handlers.insert(0, logging.FileHandler(filename=logfilename + ".log"))
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(filename)s] => %(message)s",
+        format="%(asctime)s %(message)s",
         handlers=handlers,
     )
 
