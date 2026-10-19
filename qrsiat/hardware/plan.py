@@ -26,6 +26,7 @@ class RuntimePlan:
     persistent_workers: bool
     tf32: bool
     cudnn_benchmark: bool
+    cudnn_deterministic: bool
     use_compile: bool
     grad_checkpointing: bool
     quantum_dtype: str
@@ -57,6 +58,7 @@ def create_runtime_plan(
     queue_jobs: int = 1,
     use_compile: bool = False,
     grad_checkpointing: bool = False,
+    cudnn_deterministic: bool = True,
 ) -> RuntimePlan:
     """Plan execution without probing/model execution or silently forcing CUDA."""
     if requested_mode not in {"auto", "cpu", "single", "ddp", "jobpar"}:
@@ -83,6 +85,8 @@ def create_runtime_plan(
         raise ValueError("Invalid worker, prefetch, or queue configuration")
     if num_workers is not None and num_workers < 0:
         raise ValueError("num_workers must be non-negative or None")
+    if not isinstance(cudnn_deterministic, bool):
+        raise ValueError("cudnn_deterministic must be a boolean")
 
     warnings = list(profile.warnings)
     gpu_count = len(profile.gpus)
@@ -193,7 +197,8 @@ def create_runtime_plan(
         pin_memory=is_cuda,
         persistent_workers=workers > 0,
         tf32=tf32,
-        cudnn_benchmark=is_cuda,
+        cudnn_benchmark=is_cuda and not cudnn_deterministic,
+        cudnn_deterministic=cudnn_deterministic,
         use_compile=use_compile,
         grad_checkpointing=grad_checkpointing,
         quantum_dtype="fp32",

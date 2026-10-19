@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 from torch.distributions.multivariate_normal import MultivariateNormal
 from utils.toolkit import tensor2numpy, accuracy
 from scipy.spatial.distance import cdist
-import time
 EPSILON = 1e-8
 batch_size = 64
 
@@ -356,32 +355,7 @@ class BaseLearner(object):
                 for index in range(new_class_count)
             ]
             self.radius = np.sqrt(np.mean(per_class_radius))
-            print(self.radius)
-
-    def displacement_cov(self, Y, class_mean, embedding_old, sigma):
-        cov = None
-        start_time = time.time()
-        for _class in range(self._known_classes):
-            loop_start_time = time.time()
-            DY = self.cov_computation(Y, class_mean[_class])
-            distance = np.sum((np.tile(Y[None, :, :], [1, 1, 1]) - np.tile(
-                embedding_old[_class, None, :], [1, Y.shape[0], 1])) ** 2, axis=2)
-            W = np.exp(-distance / (2 * sigma ** 2)) + 1e-5
-            W_norm = W / np.tile(np.sum(W, axis=1)[:, None], [1, W.shape[1]])
-            if cov is None:
-                cov = np.sum(np.tile(W_norm[:, :, None, None], [
-                    1, 1, DY.shape[1], DY.shape[2]]) * np.tile(DY[None, :, :, :], [W.shape[0], 1, 1, 1]), axis=1)
-            else:
-                displacement = np.sum(np.tile(W_norm[:, :, None, None], [
-                    1, 1, DY.shape[1], DY.shape[2]]) * np.tile(DY[None, :, :, :], [W.shape[0], 1, 1, 1]), axis=1)
-                cov = np.concatenate((cov, displacement))
-            loop_end_time = time.time()
-            print("single loop time: ", loop_end_time - loop_start_time)
-        end_time = time.time()
-        print("total loop time: ", end_time - start_time)
-
-        cov = torch.tensor(cov)
-        return cov
+            logging.getLogger(__name__).info("Estimated feature radius: %.6f", self.radius)
 
     def displacement(self, Y1, Y2, embedding_old, sigma):
         DY = Y2 - Y1
