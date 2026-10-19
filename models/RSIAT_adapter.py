@@ -606,12 +606,6 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
-            logging.info(
-                "Diagnostics written: task=%d phase=%s path=%s",
-                self._cur_task,
-                phase,
-                path,
-            )
         finally:
             self._step_module.train(module_was_training)
 
@@ -831,7 +825,9 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             )
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler, warmup_epoch):
-        prog_bar = tqdm(range(self.tuned_epochs))
+        # The timestamped logger below is the single progress line per epoch.
+        # Suppress tqdm's independent terminal line to avoid duplicate output.
+        prog_bar = tqdm(range(self.tuned_epochs), disable=True)
         context = self.args.get("runtime_context")
         plan = self.args.get("runtime_plan")
         grad_accum_steps = (
@@ -953,23 +949,24 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 postfix=f"speed={train_speed:.1f} samples/s",
                 ncols=80,
             )
-            logging.info(
-                "Task %d %s loss %.3f, loss_c %.3f, Losses_rt %.3f, "
-                "l_rs %.6f, l_qrel %.6f, l_align %.6f, l_orth %.6f, "
-                "train_acc %.2f, test_acc %.2f, speed %.1f samples/s",
-                self._cur_task,
-                meter,
-                metrics["loss"],
-                metrics["loss_c"],
-                metrics["Losses_rt"],
-                metrics["l_rs"],
-                metrics["l_qrel"],
-                metrics["l_align"],
-                metrics["l_orth"],
-                metrics["train_acc"],
-                metrics["test_acc"],
-                metrics["speed"],
-            )
+            if context is None or context.is_main:
+                logging.info(
+                    "Task %d %s loss %.3f, loss_c %.3f, Losses_rt %.3f, "
+                    "l_rs %.6f, l_qrel %.6f, l_align %.6f, l_orth %.6f, "
+                    "train_acc %.2f, test_acc %.2f, speed %.1f samples/s",
+                    self._cur_task,
+                    meter,
+                    metrics["loss"],
+                    metrics["loss_c"],
+                    metrics["Losses_rt"],
+                    metrics["l_rs"],
+                    metrics["l_qrel"],
+                    metrics["l_align"],
+                    metrics["l_orth"],
+                    metrics["train_acc"],
+                    metrics["test_acc"],
+                    metrics["speed"],
+                )
             if self.args.get("diagnostics", False) and epoch + 1 == self.tuned_epochs:
                 self._run_diagnostics("epoch_end", epoch, warmup_epoch)
 
