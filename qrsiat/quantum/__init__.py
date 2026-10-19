@@ -3,7 +3,7 @@
 from .aligner import QHybridAligner
 from .feature_map import QuantumFeatureMap
 from .kernels import KernelFactory, PairwiseKernel
-from .losses import qorth_loss, qrel_loss
+from .losses import qorth_kernel_loss, qorth_loss, qrel_loss
 from .simulator import RealStatevectorCircuit, fidelity_kernel
 
 __all__ = [
@@ -14,5 +14,6 @@ __all__ = [
     "RealStatevectorCircuit",
     "fidelity_kernel",
     "qorth_loss",
+    "qorth_kernel_loss",
     "qrel_loss",
 ]

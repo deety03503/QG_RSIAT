@@ -35,6 +35,9 @@ class QRsiatConfig:
     probe: bool | None = None
     smoke: bool = False
     diagnostics: bool = False
+    # The trainer has always seeded cuDNN deterministically.  Keep that
+    # contract explicit so backend setup cannot silently undo it.
+    cudnn_deterministic: bool = True
     output_dir: str = "./out"
     data_root: str | None = None
     resume: str = "auto"
@@ -94,6 +97,7 @@ class QRsiatConfig:
             "force_resume",
             "smoke",
             "diagnostics",
+            "cudnn_deterministic",
         )
         if any(not isinstance(getattr(self, name), bool) for name in bool_fields):
             raise ValueError("Optimization and behavior flags must be booleans")

@@ -847,6 +847,8 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             # float64 mirrors Python's old per-step ``.item()`` accumulation
             # while keeping the reduction on the device until epoch end.
             loss_sums = create_epoch_metric_accumulator(self._device)
+            rs_activity_sums = torch.zeros(2, device=self._device, dtype=torch.float64)
+            rs_activity_steps = 0
             total = 0
             optimizer.zero_grad()
             step_count = 0
@@ -905,6 +907,9 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                     self._last_loss_components,
                     correct,
                 )
+                if self._last_rs_activity is not None:
+                    rs_activity_sums.add_(self._last_rs_activity.to(torch.float64))
+                    rs_activity_steps += 1
                 total += len(targets)
                 step_count += 1
             if step_count == 0:
@@ -916,6 +921,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             # loss reads and the per-step accuracy transfer in the hot loop.
             (loss_sum, loss_c_sum, loss_rt_sum, rs_sum, rel_sum, align_sum,
              orth_sum, correct_sum) = loss_sums.detach().cpu().tolist()
+            rs_active_pos_sum, rs_active_neg_sum = rs_activity_sums.detach().cpu().tolist()
             train_acc = np.around(correct_sum * 100 / total, decimals=2)
             test_acc = self._compute_accuracy(self._network, test_loader)
             metrics = {
@@ -929,6 +935,12 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 "train_acc": train_acc,
                 "test_acc": test_acc,
                 "speed": train_speed,
+                "rs_active_pos": (
+                    rs_active_pos_sum / rs_activity_steps if rs_activity_steps else None
+                ),
+                "rs_active_neg": (
+                    rs_active_neg_sum / rs_activity_steps if rs_activity_steps else None
+                ),
             }
             prog_bar.set_description(f"Task {self._cur_task}")
             prog_bar.set_postfix(
@@ -938,6 +950,14 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 l_qrel=f"{metrics['l_qrel']:.5f}",
                 l_align=f"{metrics['l_align']:.5f}",
                 l_orth=f"{metrics['l_orth']:.5f}",
+                rs_pos_active=(
+                    f"{metrics['rs_active_pos']:.3f}"
+                    if metrics["rs_active_pos"] is not None else "n/a"
+                ),
+                rs_neg_active=(
+                    f"{metrics['rs_active_neg']:.3f}"
+                    if metrics["rs_active_neg"] is not None else "n/a"
+                ),
                 train_acc=f"{metrics['train_acc']:.2f}",
                 test_acc=f"{metrics['test_acc']:.2f}",
                 speed=f"{metrics['speed']:.1f} samples/s",
@@ -953,7 +973,8 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 logging.info(
                     "Task %d %s loss %.3f, loss_c %.3f, Losses_rt %.3f, "
                     "l_rs %.6f, l_qrel %.6f, l_align %.6f, l_orth %.6f, "
-                    "train_acc %.2f, test_acc %.2f, speed %.1f samples/s",
+                    "rs_pos_active %s, rs_neg_active %s, train_acc %.2f, "
+                    "test_acc %.2f, speed %.1f samples/s",
                     self._cur_task,
                     meter,
                     metrics["loss"],
@@ -963,6 +984,14 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                     metrics["l_qrel"],
                     metrics["l_align"],
                     metrics["l_orth"],
+                    (
+                        f"{metrics['rs_active_pos']:.3f}"
+                        if metrics["rs_active_pos"] is not None else "n/a"
+                    ),
+                    (
+                        f"{metrics['rs_active_neg']:.3f}"
+                        if metrics["rs_active_neg"] is not None else "n/a"
+                    ),
                     metrics["train_acc"],
                     metrics["test_acc"],
                     metrics["speed"],
@@ -1052,6 +1081,14 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         self._last_loss_components = torch.stack(
             [value.detach().float() for value in loss_components.values()]
         )
+        self._last_rs_activity = None
+        if lambda_rs and self.rs_loss_func is not None:
+            self._last_rs_activity = torch.stack(
+                [
+                    output["rs_active_positive_fraction"].detach().float(),
+                    output["rs_active_negative_fraction"].detach().float(),
+                ]
+            )
         result = (output["logits"], output["loss_cls"], loss_rt)
         if capture_output:
             return (*result, output, loss_components)
@@ -1064,6 +1101,8 @@ class RS_Loss(nn.Module):
         self.margin = margin
         self.kernel = kernel
         self.requires_full_precision = kernel is not None
+        self.active_positive_fraction = None
+        self.active_negative_fraction = None
 
     def forward(self, features, labels):
         device = features.device
@@ -1081,6 +1120,15 @@ class RS_Loss(nn.Module):
 
         pos_loss = F.relu(1.0 - dot_prod) * mask_pos
         neg_loss = F.relu(dot_prod - self.margin) * mask_neg
+        # Detached observability only: these fractions never affect gradients.
+        self.active_positive_fraction = (
+            ((dot_prod < 1.0) * mask_pos.bool()).sum().detach().float()
+            / mask_pos.sum().clamp_min(1.0)
+        )
+        self.active_negative_fraction = (
+            ((dot_prod > self.margin) * mask_neg.bool()).sum().detach().float()
+            / mask_neg.sum().clamp_min(1.0)
+        )
         loss = pos_loss.sum() / (mask_pos.sum() + 1e-6) + \
                self.lamda * neg_loss.sum() / (mask_neg.sum() + 1e-6)
 

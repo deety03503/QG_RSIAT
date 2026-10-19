@@ -20,14 +20,17 @@ def configure_backend(plan: Any, logger: logging.Logger | None = None) -> None:
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     previous_cudnn_tf32 = torch.backends.cudnn.allow_tf32
     previous_benchmark = torch.backends.cudnn.benchmark
+    previous_deterministic = torch.backends.cudnn.deterministic
     try:
         torch.backends.cuda.matmul.allow_tf32 = bool(plan.tf32)
         torch.backends.cudnn.allow_tf32 = bool(plan.tf32)
         torch.backends.cudnn.benchmark = bool(plan.cudnn_benchmark)
+        torch.backends.cudnn.deterministic = bool(plan.cudnn_deterministic)
     except Exception as exc:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
         torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
         torch.backends.cudnn.benchmark = previous_benchmark
+        torch.backends.cudnn.deterministic = previous_deterministic
         log.warning("Backend optimization setup failed; restored previous flags: %s", exc)
 
 

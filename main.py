@@ -69,6 +69,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--probe", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--smoke", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--cudnn_deterministic", action=argparse.BooleanOptionalAction, default=None,
+        help="Use deterministic cuDNN kernels for seed-to-seed comparisons.",
+    )
     parser.add_argument("--output_dir", "--out", dest="output_dir")
     parser.add_argument("--data_root")
     parser.add_argument("--pretrained_weights")
@@ -116,6 +120,7 @@ def _runtime(args: dict[str, Any]) -> tuple[Any, Any, Any]:
         prefetch_factor=args["prefetch_factor"],
         use_compile=args["use_compile"],
         grad_checkpointing=args["grad_checkpointing"],
+        cudnn_deterministic=args["cudnn_deterministic"],
     )
     if plan.mode == "ddp":
         state = initialize_distributed("ddp")

@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from qrsiat.runtime.precision import full_precision_context
+from qrsiat.quantum.losses import qorth_kernel_loss, qrel_loss
 
 
 try:
@@ -145,6 +146,20 @@ class StepModule(nn.Module):
                     loss_rs = float(lambda_rs) * self.rs_loss(rs_features.float(), rs_labels)
             else:
                 loss_rs = float(lambda_rs) * self.rs_loss(rs_features, rs_labels)
+        rs_active_positive_fraction = (
+            getattr(self.rs_loss, "active_positive_fraction", None)
+            if self.rs_loss is not None
+            else None
+        )
+        rs_active_negative_fraction = (
+            getattr(self.rs_loss, "active_negative_fraction", None)
+            if self.rs_loss is not None
+            else None
+        )
+        if rs_active_positive_fraction is None:
+            rs_active_positive_fraction = zero
+        if rs_active_negative_fraction is None:
+            rs_active_negative_fraction = zero
 
         if self.old_network is not None and (beta or gamma or self.mode == "rae"):
             if old_features is None:
@@ -184,8 +199,8 @@ class StepModule(nn.Module):
                             previous_kernel = self.relational_kernel_teacher(
                                 previous_global.float()
                             )
-                        loss_rel = float(beta) * float(lambda_qrel) * (
-                            (current_kernel - previous_kernel.detach()).square().mean()
+                        loss_rel = float(beta) * float(lambda_qrel) * qrel_loss(
+                            current_kernel, previous_kernel
                         )
                     if gamma and old_prototypes is None:
                         raise RuntimeError(
@@ -201,17 +216,12 @@ class StepModule(nn.Module):
                             similarity = self.orth_kernel(
                                 features.float(), aligned_prototypes.float()
                             )
-                            if similarity.shape[1] == 0:
-                                loss_orth = similarity.sum() * 0.0
-                            else:
-                                k = min(int(top_k), similarity.shape[1])
-                                if k < 1 or temperature <= 0:
-                                    raise ValueError("top_k and temperature must be positive")
-                                values = similarity.topk(k, dim=1).values
-                                weights = torch.softmax(values / temperature, dim=1)
-                                loss_orth = float(gamma) * (
-                                    weights * nn.functional.relu(values - orth_epsilon)
-                                ).sum(dim=1).mean()
+                            loss_orth = float(gamma) * qorth_kernel_loss(
+                                similarity,
+                                top_k=int(top_k),
+                                temperature=float(temperature),
+                                epsilon=float(orth_epsilon),
+                            )
                         else:
                             centering_mean = old_features.mean(dim=0, keepdim=True)
                             projected_prototypes = self.aligner(
@@ -239,6 +249,8 @@ class StepModule(nn.Module):
             "loss_rel": loss_rel,
             "loss_align": loss_align,
             "loss_orth": loss_orth,
+            "rs_active_positive_fraction": rs_active_positive_fraction,
+            "rs_active_negative_fraction": rs_active_negative_fraction,
         }
 
     def _gather_pairs(self, features: Any, labels: Any) -> tuple[Any, Any]:
