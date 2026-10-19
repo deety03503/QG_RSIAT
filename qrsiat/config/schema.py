@@ -34,6 +34,7 @@ class QRsiatConfig:
     grad_checkpointing: bool = False
     probe: bool | None = None
     smoke: bool = False
+    diagnostics: bool = False
     output_dir: str = "./out"
     data_root: str | None = None
     resume: str = "auto"
@@ -92,6 +93,7 @@ class QRsiatConfig:
             "grad_checkpointing",
             "force_resume",
             "smoke",
+            "diagnostics",
         )
         if any(not isinstance(getattr(self, name), bool) for name in bool_fields):
             raise ValueError("Optimization and behavior flags must be booleans")

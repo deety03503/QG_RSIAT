@@ -68,6 +68,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--grad_checkpointing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--probe", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--smoke", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--diagnostics", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--output_dir", "--out", dest="output_dir")
     parser.add_argument("--data_root")
     parser.add_argument("--pretrained_weights")
