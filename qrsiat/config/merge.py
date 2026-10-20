@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any
 
 from .schema import QRsiatConfig
@@ -45,4 +46,13 @@ def merge_config(
         raise ValueError("lambda_qrel > 0 requires a positive beta coefficient.")
     if validated["orth"] == "qweighted" and gamma <= 0:
         raise ValueError("--orth qweighted requires a positive gamma coefficient.")
+    rs_margin = result.get("rs_margin")
+    if isinstance(rs_margin, bool) or not isinstance(rs_margin, (int, float)):
+        raise ValueError("Legacy rs_margin must be numeric for QR-RSIAT integration")
+    if not math.isfinite(float(rs_margin)):
+        raise ValueError("Legacy rs_margin must be finite for QR-RSIAT integration")
+    if validated["rs_kernel"] == "quantum" and not 0 <= rs_margin < 1:
+        raise ValueError(
+            "rs_kernel='quantum' requires 0 <= rs_margin < 1 because fidelity is in [0, 1]."
+        )
     return result

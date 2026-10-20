@@ -7,6 +7,7 @@ from data.data_manager import DataManager
 from utils.toolkit import count_parameters
 import os
 import random
+import time
 from pathlib import Path
 from qrsiat.utils.seed import seed_everything
 from qrsiat.utils.io import write_json_atomic
@@ -56,7 +57,7 @@ def _train(args):
         handlers.insert(0, logging.FileHandler(filename=logfilename + ".log"))
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(filename)s] => %(message)s",
+        format="%(asctime)s %(message)s",
         handlers=handlers,
     )
 
@@ -76,6 +77,7 @@ def _train(args):
     print()    
     accuracy_history = list(args.get("accuracy_curve", []))
     cnn_curve = args.get("metric_curve", {"top1": accuracy_history})
+    task_results = list(args.get("task_results", []))
     task_limit = min(data_manager.nb_tasks, 2) if args.get("smoke", False) else data_manager.nb_tasks
     for task in range(start_task, task_limit):
         if context is None or context.is_main:
@@ -84,9 +86,19 @@ def _train(args):
                 "Trainable params: {}".format(count_parameters(model._network, True))
             )
         
+        task_started = time.perf_counter()
         model.incremental_train(data_manager)
         cnn_accy = model.eval_task()
         model.after_task()
+        task_results.append(
+            {
+                "task": task,
+                "top1": float(cnn_accy["top1"]),
+                "topk": {key: float(value) for key, value in cnn_accy.items() if key.startswith("top")},
+                "grouped_accuracy": cnn_accy["grouped"],
+                "elapsed_seconds": time.perf_counter() - task_started,
+            }
+        )
         
         # save_path_base = f"ckpt/{args['prefix']}/{args['dataset']}/{args['init_cls']}_{args['increment']}"
         # if not os.path.exists(save_path_base):
@@ -107,6 +119,7 @@ def _train(args):
         cnn_curve[topk_key].append(cnn_accy[topk_key])
         args["accuracy_curve"] = list(cnn_curve["top1"])
         args["metric_curve"] = cnn_curve
+        args["task_results"] = task_results
         model._save_task_checkpoint()
 
 
@@ -124,6 +137,7 @@ def _train(args):
                     "experiment_id": args.get("experiment_id", args["dataset"]),
                     "cnn_curve": cnn_curve,
                     "average_top1": average_accuracy,
+                    "tasks": task_results,
                 },
             )
     if not cnn_curve["top1"]:
@@ -136,6 +150,7 @@ def _train(args):
                 "experiment_id": args.get("experiment_id", args["dataset"]),
                 "cnn_curve": cnn_curve,
                 "average_top1": average_accuracy,
+                "tasks": task_results,
             },
         )
     return average_accuracy
@@ -160,7 +175,7 @@ def _set_random(args):
     seed_everything(
         int(args.get("seed", 1993)),
         rank=context.rank if context is not None else 0,
-        deterministic=True,
+        deterministic=bool(args.get("cudnn_deterministic", True)),
     )
 
 

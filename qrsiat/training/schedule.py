@@ -10,17 +10,4 @@ def warmup_value(base: float, epoch: int, warmup_epochs: int) -> float:
         return float(base)
     return float(base) * min(1.0, epoch / warmup_epochs)
 
-
-def task_loss_weights(
-    epoch: int,
-    warmup_epochs: int,
-    *,
-    lambda_rs: float = 0.0,
-    beta: float = 0.0,
-    gamma: float = 0.0,
-) -> dict[str, float]:
-    return {
-        "lambda_rs": warmup_value(lambda_rs, epoch, warmup_epochs),
-        "beta": warmup_value(beta, epoch, warmup_epochs),
-        "gamma": warmup_value(gamma, epoch, warmup_epochs),
-    }
+# Additional task-weight wrappers belong with the objective that owns them.

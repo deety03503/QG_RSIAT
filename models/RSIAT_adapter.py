@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import time
 from dataclasses import replace
@@ -21,6 +22,12 @@ from qrsiat.quantum.aligner import QHybridAligner
 from qrsiat.quantum.kernels import PairwiseKernel
 from qrsiat.training.step_module import StepModule
 from qrsiat.training.schedule import warmup_value
+from qrsiat.training.diagnostics import (
+    accumulate_step_metrics,
+    create_epoch_metric_accumulator,
+    gradient_diagnostics,
+    kernel_diagnostics,
+)
 from torch.utils.data.distributed import DistributedSampler
 from qrsiat.distributed.samplers import DistributedEvalSampler
 from qrsiat.data.loaders import create_data_loader
@@ -118,6 +125,7 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         self._step_module = None
         self._training_module = None
         self._batch_probe_completed = False
+        self._diagnostic_batch = None
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -198,6 +206,8 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
 
         self.data_manager = data_manager
         self.task_sizes = list(data_manager._increments)
+        if self.args.get("diagnostics", False):
+            self._prepare_diagnostic_batch(data_manager)
         sampler = None
         eval_sampler = None
         context = self.args.get("runtime_context")
@@ -403,6 +413,201 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                 output_dir = Path(self.args.get("output_dir", "./out"))
                 write_json_atomic(output_dir / "plan.json", updated_plan.to_dict())
         logging.info("CUDA batch probe selected batch_size=%d (configured=%d)", chosen, requested)
+
+    def _prepare_diagnostic_batch(self, data_manager):
+        """Cache one deterministic, non-augmented training batch for diagnostics."""
+        context = self.args.get("runtime_context")
+        if context is not None and not context.is_main:
+            return
+        dataset = data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes),
+            source="train",
+            mode="test",
+        )
+        batch_size = max(1, min(int(self.args.get("batch_size", 48)), 64))
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        try:
+            _, images, labels = next(iter(loader))
+        except StopIteration as exc:
+            raise RuntimeError("Cannot build diagnostics batch from an empty task") from exc
+        self._diagnostic_batch = (images.detach().cpu(), labels.detach().cpu())
+
+    @staticmethod
+    def _module_parameter_norm(parameter):
+        return float(parameter.detach().float().norm().cpu())
+
+    def _feature_map_diagnostics(self, name, quantum_module, features):
+        if quantum_module is None:
+            return {}
+        feature_map = getattr(quantum_module, "quantum", quantum_module)
+        project = getattr(feature_map, "project", None)
+        if project is None:
+            project = getattr(feature_map, "down", None)
+        if project is None:
+            return {}
+        values = features.detach().float()
+        if getattr(feature_map, "centering", False) and values.shape[0] > 1:
+            values = values - values.mean(dim=0, keepdim=True)
+        with torch.no_grad():
+            projected = project(values).float()
+            result = {
+                f"{name}_sigma_u": float(projected.std(unbiased=False).cpu()),
+                f"{name}_tanh_saturation_fraction": float(
+                    (projected.tanh().abs() > 0.99).float().mean().cpu()
+                ),
+                f"{name}_W_q_or_down_frobenius": self._module_parameter_norm(project.weight),
+            }
+            theta = getattr(feature_map, "theta", None)
+            if theta is not None:
+                result[f"{name}_theta_norm"] = self._module_parameter_norm(theta)
+        return result
+
+    def _run_diagnostics(self, phase, epoch, warmup_epoch):
+        """Write one JSONL record; this path is opt-in and never steps the optimizer."""
+        if not self.args.get("diagnostics", False) or self._diagnostic_batch is None:
+            return
+        context = self.args.get("runtime_context")
+        if context is not None and not context.is_main:
+            return
+        images, labels = self._diagnostic_batch
+        images = images.to(self._device)
+        labels = labels.to(self._device)
+        module_was_training = self._step_module.training
+        self._step_module.eval()
+        try:
+            old_features = None
+            if self._cur_task > 0 and self.old_network_module_ptr is not None:
+                with torch.inference_mode():
+                    old_features = self.old_network_module_ptr.extract_vector(images).float()
+                old_features = old_features.detach().clone()
+            _, _, _, output, components = self._compute_rt_loss(
+                images,
+                labels,
+                epoch,
+                warmup_epoch,
+                module=self._step_module,
+                pair_gather_override=False,
+                old_features=old_features,
+                capture_output=True,
+            )
+            adapter_parameters = [
+                parameter
+                for name, parameter in self._network.convnet.named_parameters()
+                if parameter.requires_grad and "adapter" in name.lower()
+            ]
+            if not adapter_parameters:
+                adapter_parameters = [
+                    parameter
+                    for parameter in self._network.convnet.parameters()
+                    if parameter.requires_grad
+                ]
+            gradient_values = {"loss_cls": output["loss_cls"], **components}
+            record = {
+                "task": int(self._cur_task),
+                "phase": phase,
+                "epoch": int(epoch + 1),
+                "batch_samples": int(labels.numel()),
+                "loss_components": {
+                    name: float(value.detach().float().cpu())
+                    for name, value in gradient_values.items()
+                },
+                "gradient_diagnostics": gradient_diagnostics(
+                    gradient_values, "loss_cls", adapter_parameters
+                ),
+            }
+
+            features = output["features"].detach().float()
+            centered = features - features.mean(dim=0, keepdim=True)
+            normalized = F.normalize(features, dim=1)
+            normalized_centered = normalized - normalized.mean(dim=0, keepdim=True)
+            record["feature_rms_by_dimension"] = float(
+                centered.square().mean().sqrt().cpu()
+            )
+            record["normalized_feature_rms_by_dimension"] = float(
+                normalized_centered.square().mean().sqrt().cpu()
+            )
+
+            with torch.no_grad():
+                rs_kernel = self.rs_loss_func.kernel
+                rs_matrix = (
+                    rs_kernel(normalized)
+                    if rs_kernel is not None
+                    else normalized @ normalized.T
+                )
+                record.update(kernel_diagnostics(rs_matrix, labels, prefix="rs"))
+                if self.relational_kernel is not None:
+                    record.update(
+                        kernel_diagnostics(
+                            self.relational_kernel(features), labels, prefix="qrel"
+                        )
+                    )
+                record.update(
+                    self._feature_map_diagnostics("rs", rs_kernel, normalized)
+                )
+                record.update(
+                    self._feature_map_diagnostics(
+                        "qrel", self.relational_kernel, features
+                    )
+                )
+                record.update(
+                    self._feature_map_diagnostics("qorth", self.orth_kernel, features)
+                )
+                if self.qhybrid is not None:
+                    record.update(
+                        self._feature_map_diagnostics("aligner", self.qhybrid, features)
+                    )
+                    record["aligner_W_up_frobenius"] = self._module_parameter_norm(
+                        self.qhybrid.up.weight
+                    )
+
+                if old_features is not None:
+                    record["feature_drift_relative_norm"] = float(
+                        ((features - old_features).norm() / old_features.norm().clamp_min(1e-12)).cpu()
+                    )
+                    prototypes = torch.as_tensor(
+                        self._class_means[: self._known_classes],
+                        dtype=torch.float32,
+                        device=self._device,
+                    )
+                    if self.qhybrid is not None and prototypes.numel():
+                        aligned_prototypes = self.qhybrid(
+                            prototypes,
+                            centering_mean=old_features.mean(dim=0, keepdim=True),
+                        )
+                        record["aligned_prototype_mean_distance"] = float(
+                            (aligned_prototypes - prototypes).norm(dim=1).mean().cpu()
+                        )
+                    if self.orth_kernel is not None and prototypes.numel():
+                        aligned_prototypes = self.qhybrid(
+                            prototypes,
+                            centering_mean=old_features.mean(dim=0, keepdim=True),
+                        )
+                        orth_values = self.orth_kernel(features, aligned_prototypes)
+                        k = min(int(self.args.get("orth_top_k", 3)), orth_values.shape[1])
+                        if k > 0:
+                            top_values = orth_values.topk(k, dim=1).values
+                            qs = torch.tensor(
+                                [0.05, 0.5, 0.95, 0.99], device=top_values.device
+                            )
+                            record["qorth_G_topk_q05_q50_q95_q99"] = [
+                                float(value)
+                                for value in torch.quantile(top_values.flatten(), qs).cpu()
+                            ]
+                            epsilon = float(self.args.get("orth_epsilon", 0.2))
+                            record["qorth_P_G_top1_gt_epsilon"] = float(
+                                (top_values[:, 0] > epsilon).float().mean().cpu()
+                            )
+            path = (
+                Path(self.args.get("output_dir", "./out"))
+                / self.args["dataset"]
+                / f"seed_{self.args.get('seed', 1993)}"
+                / "diagnostics.jsonl"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+        finally:
+            self._step_module.train(module_was_training)
 
     def _save_task_checkpoint(self):
         manager = self.args.get("checkpoint_manager")
@@ -620,7 +825,9 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             )
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler, warmup_epoch):
-        prog_bar = tqdm(range(self.tuned_epochs))
+        # The timestamped logger below is the single progress line per epoch.
+        # Suppress tqdm's independent terminal line to avoid duplicate output.
+        prog_bar = tqdm(range(self.tuned_epochs), disable=True)
         context = self.args.get("runtime_context")
         plan = self.args.get("runtime_plan")
         grad_accum_steps = (
@@ -637,11 +844,17 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             sampler = getattr(train_loader, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
-            losses = 0.0
-            losses_c, losses_rt = 0.0, 0.0
-            correct, total = 0, 0
+            # float64 mirrors Python's old per-step ``.item()`` accumulation
+            # while keeping the reduction on the device until epoch end.
+            loss_sums = create_epoch_metric_accumulator(self._device)
+            rs_activity_sums = torch.zeros(2, device=self._device, dtype=torch.float64)
+            rs_activity_steps = 0
+            total = 0
             optimizer.zero_grad()
             step_count = 0
+
+            if self.args.get("diagnostics", False) and epoch == 0:
+                self._run_diagnostics("epoch_start", epoch, warmup_epoch)
 
             training_started = time.perf_counter()
             for i, (_, inputs, targets) in enumerate(train_loader):
@@ -684,11 +897,19 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
                         scaler.step(optimizer)
                         scaler.update()
                     optimizer.zero_grad()
-                losses += loss.item()
-                losses_c += loss_c.item()
-                losses_rt += loss_rt.item()
                 _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                correct = preds.eq(targets.expand_as(preds)).sum()
+                loss_sums = accumulate_step_metrics(
+                    loss_sums,
+                    loss,
+                    loss_c,
+                    loss_rt,
+                    self._last_loss_components,
+                    correct,
+                )
+                if self._last_rs_activity is not None:
+                    rs_activity_sums.add_(self._last_rs_activity.to(torch.float64))
+                    rs_activity_steps += 1
                 total += len(targets)
                 step_count += 1
             if step_count == 0:
@@ -696,21 +917,87 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             train_speed = total / max(time.perf_counter() - training_started, 1e-9)
             scheduler.step()
 
-            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+            # One device-to-host transfer per epoch replaces the three scalar
+            # loss reads and the per-step accuracy transfer in the hot loop.
+            (loss_sum, loss_c_sum, loss_rt_sum, rs_sum, rel_sum, align_sum,
+             orth_sum, correct_sum) = loss_sums.detach().cpu().tolist()
+            rs_active_pos_sum, rs_active_neg_sum = rs_activity_sums.detach().cpu().tolist()
+            train_acc = np.around(correct_sum * 100 / total, decimals=2)
             test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-                self._cur_task,
-                epoch + 1,
-                self.tuned_epochs,
-                losses / step_count,
-                losses_c/step_count,
-                losses_rt/step_count,
-                train_acc,
-                test_acc,
+            metrics = {
+                "loss": loss_sum / step_count,
+                "loss_c": loss_c_sum / step_count,
+                "Losses_rt": loss_rt_sum / step_count,
+                "l_rs": rs_sum / step_count,
+                "l_qrel": rel_sum / step_count,
+                "l_align": align_sum / step_count,
+                "l_orth": orth_sum / step_count,
+                "train_acc": train_acc,
+                "test_acc": test_acc,
+                "speed": train_speed,
+                "rs_active_pos": (
+                    rs_active_pos_sum / rs_activity_steps if rs_activity_steps else None
+                ),
+                "rs_active_neg": (
+                    rs_active_neg_sum / rs_activity_steps if rs_activity_steps else None
+                ),
+            }
+            prog_bar.set_description(f"Task {self._cur_task}")
+            prog_bar.set_postfix(
+                loss=f"{metrics['loss']:.3f}",
+                loss_c=f"{metrics['loss_c']:.3f}",
+                l_rs=f"{metrics['l_rs']:.5f}",
+                l_qrel=f"{metrics['l_qrel']:.5f}",
+                l_align=f"{metrics['l_align']:.5f}",
+                l_orth=f"{metrics['l_orth']:.5f}",
+                rs_pos_active=(
+                    f"{metrics['rs_active_pos']:.3f}"
+                    if metrics["rs_active_pos"] is not None else "n/a"
+                ),
+                rs_neg_active=(
+                    f"{metrics['rs_active_neg']:.3f}"
+                    if metrics["rs_active_neg"] is not None else "n/a"
+                ),
+                train_acc=f"{metrics['train_acc']:.2f}",
+                test_acc=f"{metrics['test_acc']:.2f}",
+                speed=f"{metrics['speed']:.1f} samples/s",
             )
-            prog_bar.set_description(info)
-            prog_bar.set_postfix(speed=f"{train_speed:.1f} samples/s")
-        logging.info(info)
+            meter = prog_bar.format_meter(
+                epoch,
+                self.tuned_epochs,
+                time.perf_counter() - training_started,
+                postfix=f"speed={train_speed:.1f} samples/s",
+                ncols=80,
+            )
+            if context is None or context.is_main:
+                logging.info(
+                    "Task %d %s loss %.3f, loss_c %.3f, Losses_rt %.3f, "
+                    "l_rs %.6f, l_qrel %.6f, l_align %.6f, l_orth %.6f, "
+                    "rs_pos_active %s, rs_neg_active %s, train_acc %.2f, "
+                    "test_acc %.2f, speed %.1f samples/s",
+                    self._cur_task,
+                    meter,
+                    metrics["loss"],
+                    metrics["loss_c"],
+                    metrics["Losses_rt"],
+                    metrics["l_rs"],
+                    metrics["l_qrel"],
+                    metrics["l_align"],
+                    metrics["l_orth"],
+                    (
+                        f"{metrics['rs_active_pos']:.3f}"
+                        if metrics["rs_active_pos"] is not None else "n/a"
+                    ),
+                    (
+                        f"{metrics['rs_active_neg']:.3f}"
+                        if metrics["rs_active_neg"] is not None else "n/a"
+                    ),
+                    metrics["train_acc"],
+                    metrics["test_acc"],
+                    metrics["speed"],
+                )
+            if self.args.get("diagnostics", False) and epoch + 1 == self.tuned_epochs:
+                self._run_diagnostics("epoch_end", epoch, warmup_epoch)
 
     def _inc_loss(self, features, features_old):
         features_old = self.old_ae(features_old)
@@ -723,7 +1010,18 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
         loss_orth = similarity.sum() / (similarity.shape[0]*similarity.shape[1])
         return self.args["beta"] * loss_align + self.args["gamma"] * loss_orth
         
-    def _compute_rt_loss(self, inputs, targets, epoch=None, warmup_epoch=10):     
+    def _compute_rt_loss(
+        self,
+        inputs,
+        targets,
+        epoch=None,
+        warmup_epoch=10,
+        *,
+        module=None,
+        pair_gather_override=None,
+        old_features=None,
+        capture_output=False,
+    ):
         if self._training_module is None:
             raise RuntimeError("Training StepModule was not initialized for this task")
         if self._cur_task == 0:
@@ -748,25 +1046,53 @@ class Learner(QRsiatLearnerMixin, BaseLearner):
             )
         context = self.args.get("runtime_context")
         autocast = context.autocast() if context is not None else torch.autocast("cpu", enabled=False)
-        with autocast:
-            output = self._training_module(
-                inputs,
-                targets,
-                class_start=self._known_classes,
-                classification_loss=self.loss_cos,
-                old_prototypes=prototypes,
-                lambda_rs=lambda_rs,
-                beta=beta,
-                gamma=gamma,
-                lambda_qrel=self.args.get("lambda_qrel", 0.0),
-                top_k=self.args.get("orth_top_k", 3),
-                temperature=self.args.get("orth_temperature", 0.1),
-                orth_epsilon=self.args.get("orth_epsilon", 0.2),
-            )
-        return output["logits"], output["loss_cls"], (
-            output["loss_rs"] + output["loss_rel"] + output["loss_align"] * beta
-            + output["loss_orth"]
+        active_module = self._training_module if module is None else module
+        original_pair_gather = None
+        if pair_gather_override is not None and hasattr(active_module, "pair_gather"):
+            original_pair_gather = active_module.pair_gather
+            active_module.pair_gather = pair_gather_override
+        try:
+            with autocast:
+                output = active_module(
+                    inputs,
+                    targets,
+                    class_start=self._known_classes,
+                    classification_loss=self.loss_cos,
+                    old_features=old_features,
+                    old_prototypes=prototypes,
+                    lambda_rs=lambda_rs,
+                    beta=beta,
+                    gamma=gamma,
+                    lambda_qrel=self.args.get("lambda_qrel", 0.0),
+                    top_k=self.args.get("orth_top_k", 3),
+                    temperature=self.args.get("orth_temperature", 0.1),
+                    orth_epsilon=self.args.get("orth_epsilon", 0.2),
+                )
+        finally:
+            if original_pair_gather is not None:
+                active_module.pair_gather = original_pair_gather
+        loss_components = {
+            "loss_rs": output["loss_rs"],
+            "loss_rel": output["loss_rel"],
+            "loss_align": output["loss_align"] * beta,
+            "loss_orth": output["loss_orth"],
+        }
+        loss_rt = sum(loss_components.values())
+        self._last_loss_components = torch.stack(
+            [value.detach().float() for value in loss_components.values()]
         )
+        self._last_rs_activity = None
+        if lambda_rs and self.rs_loss_func is not None:
+            self._last_rs_activity = torch.stack(
+                [
+                    output["rs_active_positive_fraction"].detach().float(),
+                    output["rs_active_negative_fraction"].detach().float(),
+                ]
+            )
+        result = (output["logits"], output["loss_cls"], loss_rt)
+        if capture_output:
+            return (*result, output, loss_components)
+        return result
     
 class RS_Loss(nn.Module):
     def __init__(self, lamda=0.5, margin=0.5, kernel=None):
@@ -775,6 +1101,8 @@ class RS_Loss(nn.Module):
         self.margin = margin
         self.kernel = kernel
         self.requires_full_precision = kernel is not None
+        self.active_positive_fraction = None
+        self.active_negative_fraction = None
 
     def forward(self, features, labels):
         device = features.device
@@ -792,6 +1120,15 @@ class RS_Loss(nn.Module):
 
         pos_loss = F.relu(1.0 - dot_prod) * mask_pos
         neg_loss = F.relu(dot_prod - self.margin) * mask_neg
+        # Detached observability only: these fractions never affect gradients.
+        self.active_positive_fraction = (
+            ((dot_prod < 1.0) * mask_pos.bool()).sum().detach().float()
+            / mask_pos.sum().clamp_min(1.0)
+        )
+        self.active_negative_fraction = (
+            ((dot_prod > self.margin) * mask_neg.bool()).sum().detach().float()
+            / mask_neg.sum().clamp_min(1.0)
+        )
         loss = pos_loss.sum() / (mask_pos.sum() + 1e-6) + \
                self.lamda * neg_loss.sum() / (mask_neg.sum() + 1e-6)
 
