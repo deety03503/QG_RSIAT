@@ -5,14 +5,26 @@
 import math
 import torch
 import torch.nn as nn
-from timm.models.layers import DropPath
+try:
+    from timm.layers import DropPath
+except ImportError:
+    from timm.models.layers import DropPath
 import timm
 from functools import partial
 from collections import OrderedDict
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import PatchEmbed
-from timm.models import register_model
+try:
+    from timm.layers import PatchEmbed
+except ImportError:
+    try:
+        from timm.models.vision_transformer import PatchEmbed
+    except ImportError:
+        from timm.layers.patch_embed import PatchEmbed
+try:
+    from timm.models import register_model
+except ImportError:
+    from timm.models.registry import register_model
 
 
 from collections import OrderedDict
@@ -357,6 +369,20 @@ def _load_adapter_backbone(model, checkpoint_path):
     return model.load_state_dict(compatible, strict=False)
 
 
+def _create_checkpoint_model(model_name, pretrained=False):
+    candidates = [model_name]
+    if "_in21k" in model_name:
+        candidates.append(model_name.replace("_in21k", ".orig_in21k"))
+        candidates.append("vit_base_patch16_224.orig_in21k")
+    last_err = None
+    for name in candidates:
+        try:
+            return timm.create_model(name, pretrained=pretrained, num_classes=0)
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+
 def vit_base_patch16_224_adapter(pretrained=False, checkpoint_path=None, **kwargs):
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
                               norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -364,8 +390,8 @@ def vit_base_patch16_224_adapter(pretrained=False, checkpoint_path=None, **kwarg
     if checkpoint_path:
         msg = _load_adapter_backbone(model, checkpoint_path)
     else:
-        checkpoint_model = timm.create_model(
-            "vit_base_patch16_224", pretrained=pretrained, num_classes=0
+        checkpoint_model = _create_checkpoint_model(
+            "vit_base_patch16_224", pretrained=pretrained
         )
         state_dict = checkpoint_model.state_dict()
         for key in list(state_dict.keys()):
@@ -398,8 +424,8 @@ def vit_base_patch16_224_in21k_adapter(pretrained=False, checkpoint_path=None, *
     if checkpoint_path:
         msg = _load_adapter_backbone(model, checkpoint_path)
     else:
-        checkpoint_model = timm.create_model(
-            "vit_base_patch16_224_in21k", pretrained=pretrained, num_classes=0
+        checkpoint_model = _create_checkpoint_model(
+            "vit_base_patch16_224_in21k", pretrained=pretrained
         )
         state_dict = checkpoint_model.state_dict()
         for key in list(state_dict.keys()):
