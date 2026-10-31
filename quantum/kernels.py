@@ -56,17 +56,17 @@ class PairwiseKernel(nn.Module):
     ) -> torch.Tensor:
         if self.name == "quantum":
             if other is None:
-                states, obs = self.quantum(features)
-                return fidelity_kernel(states, states, obs=obs, other_obs=obs)
+                states, _ = self.quantum(features)
+                return fidelity_kernel(states, states)
 
             center = None
             if self.quantum.centering:
                 mean_left = features.float().mean(dim=0, keepdim=True)
                 mean_right = other.float().mean(dim=0, keepdim=True)
                 center = (0.5 * (mean_left + mean_right)).detach()
-            left_states, left_obs = self.quantum(features, centering_mean=center)
-            right_states, right_obs = self.quantum(other, centering_mean=center)
-            return fidelity_kernel(left_states, right_states, obs=left_obs, other_obs=right_obs)
+            left_states, _ = self.quantum(features, centering_mean=center)
+            right_states, _ = self.quantum(other, centering_mean=center)
+            return fidelity_kernel(left_states, right_states)
 
         if self.name == "cosine":
             left = F.normalize(features.float(), p=2, dim=1)

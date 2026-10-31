@@ -16,7 +16,7 @@ from utils.loss import AngularPenaltySMLoss
 from utils.toolkit import AutoencoderSigmoid
 from quantum.aligner import QHybridAligner
 from quantum.kernels import PairwiseKernel
-from quantum.losses import qorth_kernel_loss, qrel_loss
+from quantum.losses import qorth_kernel_loss, qrel_loss, grad_scale
 import math
 num_workers = 8
 
@@ -53,6 +53,8 @@ class Learner(BaseLearner):
         self.orth_top_k = int(args.get("orth_top_k", 3))
         self.orth_temperature = float(args.get("orth_temperature", 0.1))
         self.orth_epsilon = float(args.get("orth_epsilon", 0.2))
+        # Multiplier applied only to the aligner-side gradient of the alignment MSE (default: feature dim).
+        self.qhybrid_grad_scale = float(args.get("qhybrid_grad_scale", 768.0))
 
         if self.rs_kernel_type == "quantum":
             self.rs_kernel = PairwiseKernel(
@@ -78,6 +80,7 @@ class Learner(BaseLearner):
             "loss_align": 0.0,
             "loss_qrel": 0.0,
             "loss_orth": 0.0,
+            "align_delta": 0.0,
         }
 
     def _is_baseline_incremental(self) -> bool:
@@ -300,6 +303,7 @@ class Learner(BaseLearner):
             losses = 0.0
             losses_c, losses_rt = 0.0, 0.0
             losses_rs, losses_align, losses_qrel, losses_orth = 0.0, 0.0, 0.0, 0.0
+            align_deltas = 0.0
             correct, total = 0, 0
 
             for i, (_, inputs, targets) in enumerate(train_loader):
@@ -316,6 +320,7 @@ class Learner(BaseLearner):
                 losses_align += self._last_loss_stats["loss_align"]
                 losses_qrel += self._last_loss_stats["loss_qrel"]
                 losses_orth += self._last_loss_stats["loss_orth"]
+                align_deltas += self._last_loss_stats.get("align_delta", 0.0)
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
@@ -326,7 +331,7 @@ class Learner(BaseLearner):
             num_batches = max(1, len(train_loader))
             info = (
                 "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, "
-                "Loss_rs {:.3f}, Loss_align {:.3f}, Loss_qrel {:.3f}, Loss_orth {:.3f}, "
+                "Loss_rs {:.3f}, Loss_align {:.3f}, Loss_qrel {:.4f}, Loss_orth {:.4f}, Align_delta {:.4f}, "
                 "Train_accy {:.2f}, Test_accy {:.2f}"
             ).format(
                 self._cur_task,
@@ -339,6 +344,7 @@ class Learner(BaseLearner):
                 losses_align / num_batches,
                 losses_qrel / num_batches,
                 losses_orth / num_batches,
+                align_deltas / num_batches,
                 train_acc,
                 test_acc,
             )
@@ -366,11 +372,17 @@ class Learner(BaseLearner):
         features_old_detached = features_old.detach()
 
         # 1. Feature Alignment Loss
+        align_delta = 0.0
         if self.aligner_type == "qhybrid":
             aligned_old = self.qhybrid(features_old_detached)
+            align_delta = self.qhybrid.last_delta_norm
+            # MSE averages over B*768 elements, which starves the aligner of gradient.
+            # Amplify only the aligner-side gradient; the ViT-side gradient (via `features`) is unchanged.
+            aligned_old_for_align = grad_scale(aligned_old, self.qhybrid_grad_scale)
         else:
             aligned_old = self.old_ae(features_old_detached)
-        loss_align = nn.MSELoss()(features, aligned_old)
+            aligned_old_for_align = aligned_old
+        loss_align = nn.MSELoss()(features, aligned_old_for_align)
 
         # 2. Quantum Relational Distillation Loss
         if (
@@ -388,14 +400,16 @@ class Learner(BaseLearner):
         # 3. Orthogonality Loss (plain or qweighted)
         protos = torch.from_numpy(self._class_means[:self._known_classes]).float().to(self._device, non_blocking=True)
         if self.orth_type == "qweighted":
-            with torch.no_grad():
-                if self.aligner_type == "qhybrid":
-                    old_mean = features_old_detached.float().mean(dim=0, keepdim=True)
-                    aligned_protos = self.qhybrid(protos, centering_mean=old_mean)
-                else:
-                    aligned_protos = self.old_ae(protos)
+            # As in the original RSIAT `_inc_loss`, orthogonality regularizes the aligner:
+            # aligned new-class (old-network) features vs. aligned old prototypes.
+            # No gradient reaches the ViT backbone, so the feature space used by SSCA/CA is not distorted.
+            if self.aligner_type == "qhybrid":
+                old_mean = features_old_detached.float().mean(dim=0, keepdim=True)
+                aligned_protos = self.qhybrid(protos, centering_mean=old_mean)
+            else:
+                aligned_protos = self.old_ae(protos)
             loss_orth = qorth_kernel_loss(
-                features=features,
+                features=aligned_old,
                 aligned_protos=aligned_protos,
                 kernel=self.orth_kernel,
                 top_k=self.orth_top_k,
@@ -427,6 +441,7 @@ class Learner(BaseLearner):
             "loss_align": float(loss_align.detach().item()),
             "loss_qrel": float(loss_qrel.detach().item()),
             "loss_orth": float(loss_orth.detach().item()),
+            "align_delta": align_delta,
         }
 
         return (
