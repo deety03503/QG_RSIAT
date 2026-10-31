@@ -18,7 +18,6 @@ class QHybridAligner(nn.Module):
         layers: int = 2,
         centering: bool = True,
         cycle: bool = False,
-        hidden_dim: int = 128,
     ) -> None:
         super().__init__()
         self.input_dim = int(input_dim)
@@ -26,7 +25,6 @@ class QHybridAligner(nn.Module):
         self.layers = int(layers)
         self.centering = bool(centering)
         self.cycle = bool(cycle)
-        self.hidden_dim = int(hidden_dim)
 
         self.encoder = build_angle_encoder(self.input_dim, self.n_qubits, self.layers)
         self.theta = nn.Parameter(torch.zeros(self.layers, self.n_qubits))
@@ -35,15 +33,11 @@ class QHybridAligner(nn.Module):
             layers=self.layers,
             cycle=self.cycle,
         )
-        self.up = nn.Sequential(
-            nn.Linear(2 * self.n_qubits, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.input_dim),
-        )
-        nn.init.xavier_uniform_(self.up[0].weight)
-        nn.init.zeros_(self.up[0].bias)
-        nn.init.orthogonal_(self.up[2].weight, gain=0.1)
-        nn.init.zeros_(self.up[2].bias)
+        self.up = nn.Linear(2 * self.n_qubits, self.input_dim, bias=False)
+        # Orthogonal init keeps W_up^T != 0 so the circuit receives gradient from step 0;
+        # the small residual gate keeps the initial correction near identity (||delta|| <= 0.1 * ||obs||).
+        nn.init.orthogonal_(self.up.weight, gain=1.0)
+        self.res_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         self.last_delta_norm = 0.0
 
     def encode_angles(
@@ -69,7 +63,6 @@ class QHybridAligner(nn.Module):
         angles = self.encode_angles(features_fp32, centering_mean=centering_mean)
         states = self.circuit(angles, self.theta)
         obs = self.circuit.readout(states)
-        delta = self.up(obs)
+        delta = self.up(obs) * self.res_scale
         self.last_delta_norm = float(delta.detach().norm(dim=1).mean().item())
         return features_fp32 + delta
-
