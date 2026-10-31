@@ -14,10 +14,7 @@ def get_convnet(args, pretrained=False):
         model.out_dim = 768
         return model.eval()
     elif name == "pretrained_vit_b16_224_in21k" or name == "vit_base_patch16_224_in21k":
-        try:
-            model = timm.create_model("vit_base_patch16_224_in21k", pretrained=True, num_classes=0)
-        except Exception:
-            model = timm.create_model("vit_base_patch16_224.orig_in21k", pretrained=True, num_classes=0)
+        model = timm.create_model("vit_base_patch16_224_in21k", pretrained=True, num_classes=0)
         model.out_dim = 768
         return model.eval()
 
@@ -40,28 +37,15 @@ def get_convnet(args, pretrained=False):
                 vpt_num=0,
             )
             if name == "pretrained_vit_b16_224_adapter":
-                from qrsiat.data.weights import find_pretrained_checkpoint
-                checkpoint_path = find_pretrained_checkpoint(
-                    explicit_path=args.get("pretrained_weights"),
-                    model_tokens=("vit_base_patch16_224",),
-                )
                 model = vision_transformer_adapter.vit_base_patch16_224_adapter(num_classes=0,
                                                                                 global_pool=False, drop_path_rate=0.0,
-                                                                                tuning_config=tuning_config,
-                                                                                pretrained=checkpoint_path is None,
-                                                                                checkpoint_path=checkpoint_path)
+                                                                                tuning_config=tuning_config)
                 model.out_dim = 768
             elif name == "pretrained_vit_b16_224_in21k_adapter":
-                from qrsiat.data.weights import find_pretrained_checkpoint
-                checkpoint_path = find_pretrained_checkpoint(
-                    explicit_path=args.get("pretrained_weights"),
-                )
                 model = vision_transformer_adapter.vit_base_patch16_224_in21k_adapter(num_classes=0,
                                                                                       global_pool=False,
                                                                                       drop_path_rate=0.0,
-                                                                                      tuning_config=tuning_config,
-                                                                                      pretrained=checkpoint_path is None,
-                                                                                      checkpoint_path=checkpoint_path)
+                                                                                      tuning_config=tuning_config)
                 model.out_dim = 768
             else:
                 raise NotImplementedError("Unknown type {}".format(name))
@@ -217,3 +201,5 @@ class SimpleVitNet(BaseNet):
         gamma = meanold / meannew
         print("alignweights,gamma=", gamma)
         self.fc.heads[increment][0].weight.data[-increment:, :] *= gamma
+
+
