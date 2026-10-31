@@ -1,7 +1,7 @@
 {
     "prefix": "all",
     "dataset": "imageneta",
-    "shuffle": true,
+    "shuffle": false,
     "ssca": true,
     "ca": true,
     "init_cls": 20,
