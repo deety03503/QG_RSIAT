@@ -49,7 +49,7 @@ class QHybridAligner(nn.Module):
             centering_mean=centering_mean,
         )
         raw = self.encoder(values).reshape(values.shape[0], self.layers, self.n_qubits)
-        return torch.tanh(raw) * (math.pi * 0.5)
+        return torch.tanh(raw) * math.pi
 
     def forward(
         self,
