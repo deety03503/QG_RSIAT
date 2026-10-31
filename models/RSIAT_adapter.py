@@ -149,18 +149,22 @@ class Learner(BaseLearner):
 
         if self.orth_type == "qweighted":
             if self.orth_kernel is None:
-                self.orth_kernel = PairwiseKernel(
-                    name="quantum",
-                    input_dim=768,
-                    n_qubits=self.n_qubits,
-                    layers=self.quantum_layers,
-                    centering=self.quantum_centering,
-                    cycle=self.cycle,
-                ).to(self._device)
+                if self.rs_kernel is not None and self.rs_kernel_type == "quantum":
+                    self.orth_kernel = copy.deepcopy(self.rs_kernel).to(self._device)
+                else:
+                    self.orth_kernel = PairwiseKernel(
+                        name="quantum",
+                        input_dim=768,
+                        n_qubits=self.n_qubits,
+                        layers=self.quantum_layers,
+                        centering=self.quantum_centering,
+                        cycle=self.cycle,
+                    ).to(self._device)
             else:
                 self.orth_kernel.to(self._device)
+            self.orth_kernel.eval()
             for p in self.orth_kernel.parameters():
-                p.requires_grad_(True)
+                p.requires_grad_(False)
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -260,13 +264,7 @@ class Learner(BaseLearner):
                     {'params': self.old_ae.parameters(), 'lr': aux_lr, 'weight_decay': aux_wd})
             elif self.aligner_type == "qhybrid":
                 param_groups.append(
-                    {'params': self.qhybrid.parameters(), 'lr': aux_lr, 'weight_decay': aux_wd})
-
-            if self.orth_type == "qweighted" and self.orth_kernel is not None:
-                orth_params = [p for p in self.orth_kernel.parameters() if p.requires_grad]
-                if orth_params:
-                    param_groups.append(
-                        {'params': orth_params, 'lr': aux_lr, 'weight_decay': aux_wd})
+                    {'params': self.qhybrid.parameters(), 'lr': self.init_lr, 'weight_decay': aux_wd})
 
             if self.args['optimizer'] == 'sgd':
                 optimizer = optim.SGD(param_groups, momentum=0.9)
@@ -291,7 +289,7 @@ class Learner(BaseLearner):
             if self.relational_kernel_teacher is not None:
                 self.relational_kernel_teacher.eval()
             if self.orth_type == "qweighted" and self.orth_kernel is not None:
-                self.orth_kernel.train()
+                self.orth_kernel.eval()
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler, warmup_epoch):
         prog_bar = tqdm(range(self.tuned_epochs))

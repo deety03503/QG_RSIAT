@@ -6,8 +6,12 @@ from torch.nn import functional as F
 
 
 def qrel_loss(k_current: torch.Tensor, k_old: torch.Tensor) -> torch.Tensor:
-    """Quantum Relational Distillation Loss: MSE between current and teacher kernel matrices."""
-    return (k_current.float() - k_old.float().detach()).square().mean()
+    """Quantum Relational Distillation Loss: off-diagonal MSE between current and teacher kernel matrices."""
+    b = k_current.shape[0]
+    if b <= 1:
+        return (k_current.float() - k_old.float().detach()).square().mean()
+    mask = ~torch.eye(b, dtype=torch.bool, device=k_current.device)
+    return (k_current.float()[mask] - k_old.float().detach()[mask]).square().mean()
 
 
 def qorth_kernel_loss(

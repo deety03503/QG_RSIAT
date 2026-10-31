@@ -96,8 +96,16 @@ class RealStatevectorCircuit(nn.Module):
 def fidelity_kernel(
     states: torch.Tensor,
     other: torch.Tensor | None = None,
+    obs: torch.Tensor | None = None,
+    other_obs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     left = F.normalize(states.float(), p=2, dim=1)
     right = left if other is None else F.normalize(other.float(), p=2, dim=1)
-    return (left @ right.T).square().clamp(0.0, 1.0)
+    if obs is None:
+        return (left @ right.T).square().clamp(0.0, 1.0)
+    amp_sim = (left @ right.T).abs().clamp(0.0, 1.0)
+    left_obs = F.normalize(obs.float(), p=2, dim=1)
+    right_obs = left_obs if other_obs is None else F.normalize(other_obs.float(), p=2, dim=1)
+    proj_sim = ((left_obs @ right_obs.T + 1.0) * 0.5).clamp(0.0, 1.0)
+    return (0.5 * amp_sim + 0.5 * proj_sim).clamp(0.0, 1.0)
 

@@ -33,8 +33,10 @@ class QHybridAligner(nn.Module):
             layers=self.layers,
             cycle=self.cycle,
         )
+        self.obs_norm = nn.LayerNorm(2 * self.n_qubits)
         self.up = nn.Linear(2 * self.n_qubits, self.input_dim, bias=False)
-        nn.init.zeros_(self.up.weight)
+        nn.init.orthogonal_(self.up.weight, gain=0.1)
+        self.res_scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
 
     def encode_angles(
         self,
@@ -47,7 +49,7 @@ class QHybridAligner(nn.Module):
             centering_mean=centering_mean,
         )
         raw = self.encoder(values).reshape(values.shape[0], self.layers, self.n_qubits)
-        return torch.tanh(raw) * math.pi
+        return torch.tanh(raw) * (math.pi * 0.5)
 
     def forward(
         self,
@@ -58,7 +60,7 @@ class QHybridAligner(nn.Module):
         features_fp32 = features.float()
         angles = self.encode_angles(features_fp32, centering_mean=centering_mean)
         states = self.circuit(angles, self.theta)
-        obs = self.circuit.readout(states)
-        delta = self.up(obs)
+        obs = self.obs_norm(self.circuit.readout(states))
+        delta = self.up(obs) * self.res_scale
         return features_fp32 + delta
 
