@@ -15,8 +15,8 @@
         1993
     ],
     "init_epochs": 20,
-    "warmup_epoch": 15,
-    "inc_epochs": 30,
+    "warmup_epoch": 3,
+    "inc_epochs": 15,
     "ca_epochs": 10,
     "init_lr": 0.01,
     "batch_size": 48,
