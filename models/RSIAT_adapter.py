@@ -141,13 +141,11 @@ class Learner(BaseLearner):
                     ).to(self._device)
             else:
                 self.relational_kernel.to(self._device)
+            self.relational_kernel.eval()
             for p in self.relational_kernel.parameters():
-                p.requires_grad_(True)
-
-            self.relational_kernel_teacher = copy.deepcopy(self.relational_kernel).to(self._device)
-            self.relational_kernel_teacher.eval()
-            for p in self.relational_kernel_teacher.parameters():
                 p.requires_grad_(False)
+
+            self.relational_kernel_teacher = self.relational_kernel
 
         if self.orth_type == "qweighted":
             if self.orth_kernel is None:
@@ -264,12 +262,6 @@ class Learner(BaseLearner):
                 param_groups.append(
                     {'params': self.qhybrid.parameters(), 'lr': aux_lr, 'weight_decay': aux_wd})
 
-            if self.lambda_qrel > 0.0 and self.relational_kernel is not None:
-                rel_params = [p for p in self.relational_kernel.parameters() if p.requires_grad]
-                if rel_params:
-                    param_groups.append(
-                        {'params': rel_params, 'lr': aux_lr, 'weight_decay': aux_wd})
-
             if self.orth_type == "qweighted" and self.orth_kernel is not None:
                 orth_params = [p for p in self.orth_kernel.parameters() if p.requires_grad]
                 if orth_params:
@@ -295,7 +287,7 @@ class Learner(BaseLearner):
             elif self.aligner_type == "qhybrid" and self.qhybrid is not None:
                 self.qhybrid.train()
             if self.lambda_qrel > 0.0 and self.relational_kernel is not None:
-                self.relational_kernel.train()
+                self.relational_kernel.eval()
             if self.relational_kernel_teacher is not None:
                 self.relational_kernel_teacher.eval()
             if self.orth_type == "qweighted" and self.orth_kernel is not None:
