@@ -53,6 +53,8 @@ class Learner(BaseLearner):
         self.orth_top_k = int(args.get("orth_top_k", 3))
         self.orth_temperature = float(args.get("orth_temperature", 0.1))
         self.orth_epsilon = float(args.get("orth_epsilon", 0.2))
+        self.qrel_top_k = int(args.get("qrel_top_k", 5))
+        self.qrel_temperature = float(args.get("qrel_temperature", 0.1))
         # Multiplier applied only to the aligner-side gradient of the alignment MSE (default: feature dim).
         self.qhybrid_grad_scale = float(args.get("qhybrid_grad_scale", 768.0))
 
@@ -153,16 +155,16 @@ class Learner(BaseLearner):
         if self.orth_type == "qweighted":
             if self.orth_kernel is None:
                 if self.rs_kernel is not None and self.rs_kernel_type == "quantum":
+                    # Reuse the quantum kernel learned by RS_Loss on the base task (then frozen).
                     self.orth_kernel = copy.deepcopy(self.rs_kernel).to(self._device)
                 else:
-                    self.orth_kernel = PairwiseKernel(
-                        name="quantum",
-                        input_dim=768,
-                        n_qubits=self.n_qubits,
-                        layers=self.quantum_layers,
-                        centering=self.quantum_centering,
-                        cycle=self.cycle,
-                    ).to(self._device)
+                    # No trained quantum kernel is available: a randomly-initialized frozen quantum
+                    # feature map would be an arbitrary metric, so fall back to plain cosine similarity.
+                    logging.info(
+                        "orth=qweighted with rs_kernel='%s': no trained quantum kernel, using cosine orth_kernel.",
+                        self.rs_kernel_type,
+                    )
+                    self.orth_kernel = PairwiseKernel(name="cosine", input_dim=768).to(self._device)
             else:
                 self.orth_kernel.to(self._device)
             self.orth_kernel.eval()
@@ -393,21 +395,30 @@ class Learner(BaseLearner):
             k_cur = self.relational_kernel(features)
             with torch.no_grad():
                 k_old = self.relational_kernel_teacher(features_old_detached)
-            loss_qrel = qrel_loss(k_cur, k_old)
+            loss_qrel = qrel_loss(
+                k_cur,
+                k_old,
+                top_k=self.qrel_top_k,
+                temperature=self.qrel_temperature,
+            )
         else:
             loss_qrel = features.new_zeros(())
 
         # 3. Orthogonality Loss (plain or qweighted)
+        # Old prototypes are projected by the current aligner but treated as FIXED anchors (no grad).
+        # Otherwise the aligner can reduce loss_orth by moving the projected prototypes (which no other
+        # loss constrains) instead of steering `aligned_old`, the target that `loss_align` pulls the ViT to.
         protos = torch.from_numpy(self._class_means[:self._known_classes]).float().to(self._device, non_blocking=True)
-        if self.orth_type == "qweighted":
-            # As in the original RSIAT `_inc_loss`, orthogonality regularizes the aligner:
-            # aligned new-class (old-network) features vs. aligned old prototypes.
-            # No gradient reaches the ViT backbone, so the feature space used by SSCA/CA is not distorted.
+        old_mean = features_old_detached.float().mean(dim=0, keepdim=True).detach()
+        with torch.no_grad():
             if self.aligner_type == "qhybrid":
-                old_mean = features_old_detached.float().mean(dim=0, keepdim=True)
                 aligned_protos = self.qhybrid(protos, centering_mean=old_mean)
             else:
                 aligned_protos = self.old_ae(protos)
+        aligned_protos = aligned_protos.detach()
+
+        if self.orth_type == "qweighted":
+            # Gradient flows only through `aligned_old` -> aligner; the ViT is steered indirectly via loss_align.
             loss_orth = qorth_kernel_loss(
                 features=aligned_old,
                 aligned_protos=aligned_protos,
@@ -417,11 +428,6 @@ class Learner(BaseLearner):
                 epsilon=self.orth_epsilon,
             )
         else:
-            if self.aligner_type == "qhybrid":
-                old_mean = features_old_detached.float().mean(dim=0, keepdim=True).detach()
-                aligned_protos = self.qhybrid(protos, centering_mean=old_mean)
-            else:
-                aligned_protos = self.old_ae(protos)
             aligned_protos_norm = F.normalize(aligned_protos, p=2, dim=1)
             aligned_old_norm = F.normalize(aligned_old, p=2, dim=1)
             similarity = torch.matmul(aligned_protos_norm, aligned_old_norm.t())

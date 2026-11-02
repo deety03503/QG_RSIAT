@@ -17,6 +17,8 @@ DEFAULT_QR_CONFIG = {
     "orth_top_k": 3,
     "orth_temperature": 0.1,
     "orth_epsilon": 0.2,
+    "qrel_top_k": 5,
+    "qrel_temperature": 0.1,
 }
 
 
@@ -77,6 +79,10 @@ def parse_arguments():
                         help='Softmax temperature tau for qweighted orthogonality.')
     parser.add_argument('--orth_epsilon', type=float, default=None,
                         help='Hinge threshold epsilon for qweighted orthogonality.')
+    parser.add_argument('--qrel_top_k', type=int, default=None,
+                        help='Top-k nearest neighbors per sample for relational distillation.')
+    parser.add_argument('--qrel_temperature', type=float, default=None,
+                        help='Softmax temperature tau for top-k relational distillation.')
     parser.add_argument('--rs_margin', type=float, default=None,
                         help='Optional override for RS_Loss margin.')
     parser.add_argument('--prefix', type=str, default=None,
@@ -103,6 +109,8 @@ def validate_config(config):
     config["orth_top_k"] = int(config.get("orth_top_k", 3))
     config["orth_temperature"] = float(config.get("orth_temperature", 0.1))
     config["orth_epsilon"] = float(config.get("orth_epsilon", 0.2))
+    config["qrel_top_k"] = int(config.get("qrel_top_k", 5))
+    config["qrel_temperature"] = float(config.get("qrel_temperature", 0.1))
 
     if config["aligner"] not in {"rae", "qhybrid"}:
         raise ValueError(f"Unsupported aligner: {config['aligner']}")
