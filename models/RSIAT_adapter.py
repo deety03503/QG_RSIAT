@@ -16,7 +16,7 @@ from utils.loss import AngularPenaltySMLoss
 from utils.toolkit import AutoencoderSigmoid
 from quantum.aligner import QHybridAligner
 from quantum.kernels import PairwiseKernel
-from quantum.losses import qorth_kernel_loss, qrel_loss, grad_scale
+from quantum.losses import qorth_kernel_loss, qrel_loss, grad_scale, q_supcon_loss, _root_fidelity
 import math
 num_workers = 8
 
@@ -46,6 +46,9 @@ class Learner(BaseLearner):
         self.kernel_type = str(args.get("kernel", "cosine")).lower()
         self.orth_type = str(args.get("orth", "plain")).lower()
         self.rs_kernel_type = str(args.get("rs_kernel", "cosine")).lower()
+        self.rs_loss_type = str(args.get("rs_loss_type", "supcon" if self.rs_kernel_type == "quantum" else "hinge")).lower()
+        self.rs_temperature = float(args.get("rs_temperature", 0.1))
+        self.rs_encoder_freeze = bool(args.get("rs_encoder_freeze", False))
         self.n_qubits = int(args.get("n_qubits", 8))
         self.quantum_layers = int(args.get("quantum_layers", 2))
         self.quantum_centering = bool(args.get("quantum_centering", True))
@@ -67,10 +70,26 @@ class Learner(BaseLearner):
                 centering=self.quantum_centering,
                 cycle=self.cycle,
             ).to(self._device)
-            self.rs_loss_func = RS_Loss(self.args["alpha"], self.args["rs_margin"], kernel=self.rs_kernel)
+            if self.rs_encoder_freeze and hasattr(self.rs_kernel, "quantum"):
+                logging.info("Freezing classical angle encoder of rs_kernel (forcing ViT adapter steering)")
+                for p in self.rs_kernel.quantum.encoder.parameters():
+                    p.requires_grad_(False)
+            self.rs_loss_func = RS_Loss(
+                self.args["alpha"],
+                self.args["rs_margin"],
+                kernel=self.rs_kernel,
+                loss_type=self.rs_loss_type,
+                temperature=self.rs_temperature,
+            )
         else:
             self.rs_kernel = None
-            self.rs_loss_func = RS_Loss(self.args["alpha"], self.args["rs_margin"], kernel=None)
+            self.rs_loss_func = RS_Loss(
+                self.args["alpha"],
+                self.args["rs_margin"],
+                kernel=None,
+                loss_type=self.rs_loss_type,
+                temperature=self.rs_temperature,
+            )
 
         self.old_ae = None
         self.qhybrid = None
@@ -238,6 +257,9 @@ class Learner(BaseLearner):
             ]
             if self.rs_kernel_type == "quantum" and self.rs_kernel is not None:
                 self.rs_kernel.to(self._device)
+                if self.rs_encoder_freeze and hasattr(self.rs_kernel, "quantum"):
+                    for p in self.rs_kernel.quantum.encoder.parameters():
+                        p.requires_grad_(False)
                 rs_params = [p for p in self.rs_kernel.parameters() if p.requires_grad]
                 if rs_params:
                     param_groups.append(
@@ -306,6 +328,7 @@ class Learner(BaseLearner):
             losses_c, losses_rt = 0.0, 0.0
             losses_rs, losses_align, losses_qrel, losses_orth = 0.0, 0.0, 0.0, 0.0
             align_deltas = 0.0
+            f_poss, f_negs = 0.0, 0.0
             correct, total = 0, 0
 
             for i, (_, inputs, targets) in enumerate(train_loader):
@@ -323,6 +346,8 @@ class Learner(BaseLearner):
                 losses_qrel += self._last_loss_stats["loss_qrel"]
                 losses_orth += self._last_loss_stats["loss_orth"]
                 align_deltas += self._last_loss_stats.get("align_delta", 0.0)
+                f_poss += self._last_loss_stats.get("f_pos", 0.0)
+                f_negs += self._last_loss_stats.get("f_neg", 0.0)
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
@@ -331,25 +356,44 @@ class Learner(BaseLearner):
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             test_acc = self._compute_accuracy(self._network, test_loader)
             num_batches = max(1, len(train_loader))
-            info = (
-                "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, "
-                "Loss_rs {:.3f}, Loss_align {:.3f}, Loss_qrel {:.4f}, Loss_orth {:.4f}, Align_delta {:.4f}, "
-                "Train_accy {:.2f}, Test_accy {:.2f}"
-            ).format(
-                self._cur_task,
-                epoch + 1,
-                self.tuned_epochs,
-                losses / num_batches,
-                losses_c / num_batches,
-                losses_rt / num_batches,
-                losses_rs / num_batches,
-                losses_align / num_batches,
-                losses_qrel / num_batches,
-                losses_orth / num_batches,
-                align_deltas / num_batches,
-                train_acc,
-                test_acc,
-            )
+            if self._cur_task == 0 and self.rs_loss_type == "supcon":
+                info = (
+                    "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, "
+                    "Loss_rs {:.3f}, F_pos {:.4f}, F_neg {:.4f}, "
+                    "Train_accy {:.2f}, Test_accy {:.2f}"
+                ).format(
+                    self._cur_task,
+                    epoch + 1,
+                    self.tuned_epochs,
+                    losses / num_batches,
+                    losses_c / num_batches,
+                    losses_rt / num_batches,
+                    losses_rs / num_batches,
+                    f_poss / num_batches,
+                    f_negs / num_batches,
+                    train_acc,
+                    test_acc,
+                )
+            else:
+                info = (
+                    "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, "
+                    "Loss_rs {:.3f}, Loss_align {:.3f}, Loss_qrel {:.4f}, Loss_orth {:.4f}, Align_delta {:.4f}, "
+                    "Train_accy {:.2f}, Test_accy {:.2f}"
+                ).format(
+                    self._cur_task,
+                    epoch + 1,
+                    self.tuned_epochs,
+                    losses / num_batches,
+                    losses_c / num_batches,
+                    losses_rt / num_batches,
+                    losses_rs / num_batches,
+                    losses_align / num_batches,
+                    losses_qrel / num_batches,
+                    losses_orth / num_batches,
+                    align_deltas / num_batches,
+                    train_acc,
+                    test_acc,
+                )
             prog_bar.set_description(info)
         logging.info(info)
 
@@ -471,6 +515,8 @@ class Learner(BaseLearner):
                 "loss_align": 0.0,
                 "loss_qrel": 0.0,
                 "loss_orth": 0.0,
+                "f_pos": float(getattr(self.rs_loss_func, "last_stats", {}).get("f_pos", 0.0)),
+                "f_neg": float(getattr(self.rs_loss_func, "last_stats", {}).get("f_neg", 0.0)),
             }
             return logits, loss_c, loss_base
 
@@ -483,28 +529,47 @@ class Learner(BaseLearner):
 
 
 class RS_Loss(nn.Module):
-    def __init__(self, lamda=0.5, margin=0.5, kernel=None):
+    def __init__(self, lamda=0.5, margin=0.5, kernel=None, loss_type="supcon", temperature=0.1):
         super(RS_Loss, self).__init__()
         self.lamda = lamda
         self.margin = margin
         self.kernel = kernel
+        self.loss_type = str(loss_type).lower()
+        self.temperature = float(temperature)
+        self.last_stats = {"f_pos": 0.0, "f_neg": 0.0}
 
     def forward(self, features, labels):
         device = features.device
-        labels = labels[:, None]
-        mask = torch.eq(labels, labels.t()).float().to(device)
+        if self.kernel is None:
+            features_norm = F.normalize(features, p=2, dim=1)
+            dot_prod = torch.matmul(features_norm, features_norm.t())
+            # For SupCon, map cosine from [-1, 1] to [0, 1]
+            sim = (dot_prod + 1.0) * 0.5
+        else:
+            dot_prod = self.kernel(features.float())
+            sim = _root_fidelity(dot_prod)
+
+        if self.loss_type == "supcon":
+            loss, stats = q_supcon_loss(sim, labels, temperature=self.temperature)
+            self.last_stats = stats
+            return loss
+
+        # Legacy Hinge loss
+        labels_col = labels[:, None]
+        mask = torch.eq(labels_col, labels_col.t()).float().to(device)
         eye = torch.eye(mask.size(0), device=device)
         mask_pos = mask - eye
         mask_neg = 1.0 - mask
-        if self.kernel is None:
-            features = F.normalize(features, p=2, dim=1)
-            dot_prod = torch.matmul(features, features.t())
-        else:
-            dot_prod = self.kernel(features.float())
 
         pos_loss = F.relu(1.0 - dot_prod) * mask_pos
         neg_loss = F.relu(dot_prod - self.margin) * mask_neg
         loss = pos_loss.sum() / (mask_pos.sum() + 1e-6) + \
                self.lamda * neg_loss.sum() / (mask_neg.sum() + 1e-6)
 
+        pos_sim = dot_prod[mask_pos.bool()]
+        neg_sim = dot_prod[mask_neg.bool()]
+        self.last_stats = {
+            "f_pos": float(pos_sim.mean().item()) if pos_sim.numel() > 0 else 1.0,
+            "f_neg": float(neg_sim.mean().item()) if neg_sim.numel() > 0 else 0.0,
+        }
         return loss

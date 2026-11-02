@@ -28,6 +28,51 @@ def _overlap_amplitude(kernel: nn.Module, a: torch.Tensor, b: torch.Tensor) -> t
     return kernel(a.float(), b.float()).float().clamp(0.0, 1.0)
 
 
+def q_supcon_loss(
+    sim: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 0.1,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Quantum Supervised Contrastive Loss (Khosla et al., NeurIPS 2020) on overlap amplitudes.
+
+    Args:
+        sim: [B, B] similarity matrix (overlap amplitudes in [0, 1]).
+        labels: [B] class labels.
+        temperature: softmax temperature tau > 0.
+
+    Returns:
+        loss: scalar Supervised Contrastive Loss tensor.
+        stats: dict containing 'f_pos' and 'f_neg' (mean similarities for positive and negative pairs).
+    """
+    device = sim.device
+    b = sim.shape[0]
+    if b <= 1:
+        return sim.new_zeros(()), {"f_pos": 1.0, "f_neg": 0.0}
+
+    labels = labels.view(-1, 1)
+    eye = torch.eye(b, dtype=torch.bool, device=device)
+    pos_mask = torch.eq(labels, labels.t()) & (~eye)
+    neg_mask = (~torch.eq(labels, labels.t())) & (~eye)
+
+    f_pos = float(sim[pos_mask].mean().item()) if pos_mask.any() else 1.0
+    f_neg = float(sim[neg_mask].mean().item()) if neg_mask.any() else 0.0
+
+    pos_counts = pos_mask.sum(dim=1)
+    valid_anchors = pos_counts > 0
+
+    if not valid_anchors.any():
+        return sim.new_zeros(()), {"f_pos": f_pos, "f_neg": f_neg}
+
+    temp = max(float(temperature), 1e-6)
+    logits = (sim / temp).masked_fill(eye, -1e9)
+    log_prob = F.log_softmax(logits, dim=1)
+
+    mean_log_prob_pos = (log_prob * pos_mask.float()).sum(dim=1)[valid_anchors] / pos_counts[valid_anchors].float()
+    loss = -mean_log_prob_pos.mean()
+
+    return loss, {"f_pos": f_pos, "f_neg": f_neg}
+
+
 class _GradScale(torch.autograd.Function):
     """Identity in forward, multiplies the gradient by `scale` in backward."""
 

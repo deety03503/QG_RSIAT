@@ -19,6 +19,9 @@ DEFAULT_QR_CONFIG = {
     "orth_epsilon": 0.2,
     "qrel_top_k": 5,
     "qrel_temperature": 0.1,
+    "rs_loss_type": "supcon",
+    "rs_temperature": 0.1,
+    "rs_encoder_freeze": False,
 }
 
 
@@ -85,6 +88,12 @@ def parse_arguments():
                         help='Softmax temperature tau for top-k relational distillation.')
     parser.add_argument('--rs_margin', type=float, default=None,
                         help='Optional override for RS_Loss margin.')
+    parser.add_argument('--rs_loss_type', type=str, choices=['supcon', 'hinge'], default=None,
+                        help='Loss type for Base-task Representation Steering (supcon or hinge).')
+    parser.add_argument('--rs_temperature', type=float, default=None,
+                        help='Softmax temperature tau for base-task Q-SupCon loss.')
+    parser.add_argument('--rs_encoder_freeze', type=_str2bool, nargs='?', const=True, default=None,
+                        help='Freeze classical angle encoder of rs_kernel to avoid representation shortcut.')
     parser.add_argument('--prefix', type=str, default=None,
                         help='Optional experiment log prefix override.')
     return parser.parse_args()
@@ -111,6 +120,9 @@ def validate_config(config):
     config["orth_epsilon"] = float(config.get("orth_epsilon", 0.2))
     config["qrel_top_k"] = int(config.get("qrel_top_k", 5))
     config["qrel_temperature"] = float(config.get("qrel_temperature", 0.1))
+    config["rs_loss_type"] = str(config.get("rs_loss_type", "supcon")).lower()
+    config["rs_temperature"] = float(config.get("rs_temperature", 0.1))
+    config["rs_encoder_freeze"] = bool(config.get("rs_encoder_freeze", False))
 
     if config["aligner"] not in {"rae", "qhybrid"}:
         raise ValueError(f"Unsupported aligner: {config['aligner']}")
@@ -120,8 +132,10 @@ def validate_config(config):
         raise ValueError(f"Unsupported orth mode: {config['orth']}")
     if config["rs_kernel"] not in {"cosine", "quantum"}:
         raise ValueError(f"Unsupported rs_kernel: {config['rs_kernel']}")
+    if config["rs_loss_type"] not in {"supcon", "hinge"}:
+        raise ValueError(f"Unsupported rs_loss_type: {config['rs_loss_type']}")
 
-    if config["rs_kernel"] == "quantum":
+    if config["rs_kernel"] == "quantum" and config["rs_loss_type"] == "hinge":
         rs_margin = float(config.get("rs_margin", 0.5))
         if not (0.0 <= rs_margin < 1.0):
             raise ValueError(
