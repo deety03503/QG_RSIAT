@@ -12,7 +12,7 @@
     "seed": [1993],
 
     "init_epochs": 30,
-    "warmup_epoch":4,
+    "warmup_epoch": 4,
     "inc_epochs": 30,
     "ca_epochs": 10,
     "init_lr": 0.006734973446816302,
@@ -31,5 +31,16 @@
     "gamma": 1.5,
     "ae_code_dims": 384,
     "ae_init_lr": 0.00016714136601737281,
-    "ae_weight_decay": 0.004098198825078632
+    "ae_weight_decay": 0.004098198825078632,
+
+    "num_qubits": 8,
+    "q_layers": 2,
+    "q_tau": 0.15,
+    "aligner_alpha": 0.5,
+    "orth_topk": 5,
+    "orth_eps": 0.15,
+    "orth_tau": 0.1,
+    "rel_topk": 8,
+    "rel_tau": 0.15,
+    "eta_qrel": 1.0
 }

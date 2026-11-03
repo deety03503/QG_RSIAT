@@ -1,21 +1,25 @@
-import copy
 import logging
 import numpy as np
 import torch
 from torch import nn
-from torch.serialization import load
 from tqdm import tqdm
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from utils.inc_net import SimpleVitNet
-from torch.distributions.multivariate_normal import MultivariateNormal
 from models.base import BaseLearner
-from utils.toolkit import count_parameters, log_count_parameter, target2onehot, tensor2numpy
+from utils.toolkit import log_count_parameter, tensor2numpy
 from utils.loss import AngularPenaltySMLoss
-from utils.toolkit import AutoencoderSigmoid
-import math
+from quantum import (
+    QuantumStateSimulator,
+    QuantumHybridAligner,
+    QSupConLoss,
+    SelectiveQuantumOrthLoss,
+    TopKQuantumRelLoss,
+)
+
 num_workers = 8
+
 
 class Learner(BaseLearner):
     def __init__(self, args):
@@ -35,17 +39,44 @@ class Learner(BaseLearner):
 
         self.logit_norm = None
         self.tuned_epochs = None
-        self.rs_loss_func = RS_Loss(self.args["alpha"], self.args["rs_margin"])
+
+        num_qubits = self.args.get("num_qubits", 8)
+        q_layers = self.args.get("q_layers", 2)
+        q_tau = self.args.get("q_tau", 0.15)
+        orth_topk = self.args.get("orth_topk", 5)
+        orth_eps = self.args.get("orth_eps", 0.15)
+        orth_tau = self.args.get("orth_tau", 0.1)
+        rel_topk = self.args.get("rel_topk", 8)
+        rel_tau = self.args.get("rel_tau", 0.15)
+        self.eta_qrel = self.args.get("eta_qrel", 1.0)
+
+        self.quantum_sim = QuantumStateSimulator(
+            input_dim=self._network.feature_dim,
+            num_qubits=num_qubits,
+            num_layers=q_layers,
+        ).to(self._device)
+
+        self.rs_loss_func = QSupConLoss(temperature=q_tau)
+        self.q_orth_loss_func = SelectiveQuantumOrthLoss(
+            topk=orth_topk,
+            margin_eps=orth_eps,
+            temperature=orth_tau,
+        )
+        self.q_rel_loss_func = TopKQuantumRelLoss(
+            topk=rel_topk,
+            temperature=rel_tau,
+        )
         self.old_ae = None
 
     def after_task(self):
+        if self._cur_task == 0:
+            self.quantum_sim.freeze()
         self._known_classes = self._total_classes
         self._old_network = self._network.copy().freeze()
-        if hasattr(self._old_network,"module"):
+        if hasattr(self._old_network, "module"):
             self.old_network_module_ptr = self._old_network.module
         else:
             self.old_network_module_ptr = self._old_network
-
 
     def extract_features(self, trainloader, model, args):
         model = model.eval()
@@ -66,104 +97,158 @@ class Learner(BaseLearner):
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
-        
+
         if self._cur_task == 1:
-            self.old_ae = AutoencoderSigmoid(input_dims=768, code_dims=self.args["ae_code_dims"])
+            self.quantum_sim.freeze()
+            self.old_ae = QuantumHybridAligner(
+                input_dims=self.feature_dim,
+                code_dims=self.args["ae_code_dims"],
+                quantum_sim=self.quantum_sim,
+                alpha_init=self.args.get("aligner_alpha", 0.5),
+            )
             self.old_ae.to(self._device)
-            
+        elif self._cur_task > 1 and self.old_ae is not None:
+            self.old_ae.reset_parameters_for_task()
+
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
-        # self._network.update_fc(data_manager.get_task_size(self._cur_task)*4)
         self._network.update_fc(data_manager.get_task_size(self._cur_task))
         self._network_module_ptr = self._network
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
-    
-        train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source="train",
-                                                 mode="train")
+
+        train_dataset = data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes),
+            source="train",
+            mode="train",
+        )
 
         self.train_dataset = train_dataset
         print("The number of training dataset:", len(self.train_dataset))
 
         self.data_manager = data_manager
-        self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=8)
-        test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
-        self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8)
+        self.train_loader = DataLoader(
+            train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers
+        )
+        test_dataset = data_manager.get_dataset(
+            np.arange(0, self._total_classes), source="test", mode="test"
+        )
+        self.test_loader = DataLoader(
+            test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers
+        )
 
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
 
-      
-        if self._cur_task >0:
+        if self._cur_task > 0:
             self._network.to(self._device)
             train_embeddings_old, _ = self.extract_features(self.train_loader, self._network, None)
 
         self._train(self.train_loader, self.test_loader)
-        
+
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
-      
-        if self._cur_task >0:
+        if self._cur_task > 0:
             train_embeddings_new, _ = self.extract_features(self.train_loader, self._network, None)
             old_class_mean = self._class_means[:self._known_classes]
             gap = self.displacement(train_embeddings_old, train_embeddings_new, old_class_mean, 4.0)
             if self.args['ssca'] is True:
-                old_class_mean +=gap
+                old_class_mean += gap
                 self._class_means[:self._known_classes] = old_class_mean
 
         self._network.fc.backup()
         self._compute_class_mean(data_manager, check_diff=False, oracle=False)
         task_size = data_manager.get_task_size(self._cur_task)
 
-        if self._cur_task>0 and self.args['ca_epochs']>0 and self.args['ca'] is True:
+        if self._cur_task > 0 and self.args['ca_epochs'] > 0 and self.args['ca'] is True:
             self._stage2_compact_classifier(task_size, self.args['ca_epochs'])
             if len(self._multiple_gpus) > 1:
                 self._network = self._network.module
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
+        self.quantum_sim.to(self._device)
         if self._cur_task == 0:
+            self.quantum_sim.train()
             self.tuned_epochs = self.args["init_epochs"]
             param_groups = [
-                {'params': self._network.convnet.blocks[-1].parameters(), 'lr': 0.01,
-                 'weight_decay': self.args['weight_decay']},
-                {'params': self._network.convnet.blocks[:-1].parameters(), 'lr': 0.01,
-                 'weight_decay': self.args['weight_decay']},
-                {'params': self._network.fc.parameters(), 'lr': 0.01, 'weight_decay': self.args['weight_decay']}
+                {
+                    'params': self._network.convnet.blocks[-1].parameters(),
+                    'lr': 0.01,
+                    'weight_decay': self.args['weight_decay'],
+                },
+                {
+                    'params': self._network.convnet.blocks[:-1].parameters(),
+                    'lr': 0.01,
+                    'weight_decay': self.args['weight_decay'],
+                },
+                {
+                    'params': self._network.fc.parameters(),
+                    'lr': 0.01,
+                    'weight_decay': self.args['weight_decay'],
+                },
+                {
+                    'params': self.quantum_sim.parameters(),
+                    'lr': 0.01,
+                    'weight_decay': self.args['weight_decay'],
+                },
             ]
 
             if self.args['optimizer'] == 'sgd':
-                optimizer = optim.SGD(param_groups, momentum=0.9, lr=self.init_lr, weight_decay=self.weight_decay)
+                optimizer = optim.SGD(
+                    param_groups, momentum=0.9, lr=self.init_lr, weight_decay=self.weight_decay
+                )
             elif self.args['optimizer'] == 'adam':
-                optimizer = optim.AdamW(self._network.parameters(), lr=self.init_lr, weight_decay=self.weight_decay)
-                
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.tuned_epochs, eta_min=self.min_lr)
+                optimizer = optim.AdamW(
+                    param_groups, lr=self.init_lr, weight_decay=self.weight_decay
+                )
+
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.tuned_epochs, eta_min=self.min_lr
+            )
             log_count_parameter(param_groups)
             self._init_train(train_loader, test_loader, optimizer, scheduler, self.args['warmup_epoch'])
         else:
+            self.quantum_sim.eval()
             self.tuned_epochs = self.args['inc_epochs']
-            param_groups = []
-            param_groups.append(
-                {'params': self._network.convnet.parameters(), 'lr': self.init_lr, 'weight_decay': self.weight_decay})
-            param_groups.append(
-                {'params': self._network.fc.parameters(), 'lr': self.init_lr, 'weight_decay': self.weight_decay})
-            param_groups.append(
-                {'params': self.old_ae.parameters(), 'lr': self.args['ae_init_lr'], 'weight_decay': self.args['ae_weight_decay']})
-            
+            param_groups = [
+                {
+                    'params': self._network.convnet.parameters(),
+                    'lr': self.init_lr,
+                    'weight_decay': self.weight_decay,
+                },
+                {
+                    'params': self._network.fc.parameters(),
+                    'lr': self.init_lr,
+                    'weight_decay': self.weight_decay,
+                },
+                {
+                    'params': self.old_ae.parameters(),
+                    'lr': self.args['ae_init_lr'],
+                    'weight_decay': self.args['ae_weight_decay'],
+                },
+            ]
+
             if self.args['optimizer'] == 'sgd':
                 optimizer = optim.SGD(param_groups, momentum=0.9)
             elif self.args['optimizer'] == 'adam':
-                optimizer = optim.AdamW(self._network.parameters(), lr=self.init_lr, weight_decay=self.weight_decay)
+                optimizer = optim.AdamW(
+                    param_groups, lr=self.init_lr, weight_decay=self.weight_decay
+                )
 
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.tuned_epochs, eta_min=self.min_lr)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.tuned_epochs, eta_min=self.min_lr
+            )
             log_count_parameter(param_groups)
             self._init_train(train_loader, test_loader, optimizer, scheduler, self.args['warmup_epoch'])
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler, warmup_epoch):
         prog_bar = tqdm(range(self.tuned_epochs))
-        
+
         for _, epoch in enumerate(prog_bar):
             self._network.train()
+            if self.old_ae is not None:
+                self.old_ae.train()
             losses = 0.0
             losses_c, losses_rt = 0.0, 0.0
             correct, total = 0, 0
@@ -190,8 +275,8 @@ class Learner(BaseLearner):
                 epoch + 1,
                 self.tuned_epochs,
                 losses / len(train_loader),
-                losses_c/len(train_loader),
-                losses_rt/len(train_loader),
+                losses_c / len(train_loader),
+                losses_rt / len(train_loader),
                 train_acc,
                 test_acc,
             )
@@ -199,50 +284,39 @@ class Learner(BaseLearner):
         logging.info(info)
 
     def _inc_loss(self, features, features_old):
-        features_old = self.old_ae(features_old)
-        loss_align = nn.MSELoss()(features, features_old)
-        features_old_norm = F.normalize(features_old, p=2, dim=1)
-        protos = torch.from_numpy(self._class_means).float().to(self._device,non_blocking=True)
-        protos = self.old_ae(protos)
-        protos = F.normalize(protos, p=2, dim=1)
-        similarity = torch.matmul(protos, features_old_norm.t())
-        loss_orth = similarity.sum() / (similarity.shape[0]*similarity.shape[1])
-        return self.args["beta"] * loss_align + self.args["gamma"] * loss_orth
-        
-    def _compute_rt_loss(self, inputs, targets, epoch=None, warmup_epoch=10):     
-        loss_cos=AngularPenaltySMLoss(loss_type='cosface', eps=1e-7, s=self.args["scale"], m=self.args["margin"])
+        aligned_old = self.old_ae(features_old)
+        loss_align = F.mse_loss(features, aligned_old)
+
+        protos = torch.from_numpy(self._class_means[:self._known_classes]).float().to(
+            self._device, non_blocking=True
+        )
+        aligned_protos = self.old_ae(protos)
+
+        loss_orth = self.q_orth_loss_func(
+            aligned_old, features, aligned_protos, self.quantum_sim
+        )
+        loss_qrel = self.q_rel_loss_func(features, features_old, self.quantum_sim)
+
+        return (
+            self.args["beta"] * loss_align
+            + self.args["gamma"] * loss_orth
+            + self.eta_qrel * loss_qrel
+        )
+
+    def _compute_rt_loss(self, inputs, targets, epoch=None, warmup_epoch=10):
+        loss_cos = AngularPenaltySMLoss(
+            loss_type='cosface', eps=1e-7, s=self.args["scale"], m=self.args["margin"]
+        )
         features = self._network_module_ptr.extract_vector(inputs)
         logits = self._network_module_ptr.fc(features)["logits"]
-        loss_c=loss_cos(logits[:, self._known_classes:], targets - self._known_classes)
+        loss_c = loss_cos(logits[:, self._known_classes:], targets - self._known_classes)
 
         if self._cur_task == 0:
-            lambda_rs = self.args["lambda_rs"] * min(1.0, epoch / warmup_epoch)
-            loss_base = lambda_rs * self.rs_loss_func(features, targets)
+            lambda_rs = self.args["lambda_rs"] * min(1.0, epoch / max(1, warmup_epoch))
+            loss_base = lambda_rs * self.rs_loss_func(features, targets, self.quantum_sim)
             return logits, loss_c, loss_base
-        
-        features_old = self.old_network_module_ptr.extract_vector(inputs)
+
+        with torch.no_grad():
+            features_old = self.old_network_module_ptr.extract_vector(inputs)
         loss_inc = self._inc_loss(features, features_old)
         return logits, loss_c, loss_inc
-    
-class RS_Loss(nn.Module):
-    def __init__(self, lamda=0.5, margin=0.5):
-        super(RS_Loss, self).__init__()
-        self.lamda = lamda
-        self.margin = margin
-
-    def forward(self, features, labels):
-        device = features.device
-        features = F.normalize(features, p=2, dim=1)
-        labels = labels[:, None]
-        mask = torch.eq(labels, labels.t()).float().to(device)
-        eye = torch.eye(mask.size(0), device=device)
-        mask_pos = mask - eye
-        mask_neg = 1.0 - mask
-        dot_prod = torch.matmul(features, features.t())
-
-        pos_loss = F.relu(1.0 - dot_prod) * mask_pos
-        neg_loss = F.relu(dot_prod - self.margin) * mask_neg
-        loss = pos_loss.sum() / (mask_pos.sum() + 1e-6) + \
-               self.lamda * neg_loss.sum() / (mask_neg.sum() + 1e-6)
-
-        return loss
