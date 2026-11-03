@@ -56,14 +56,14 @@ class QHybridAligner(nn.Module):
         # Orthogonal initialization keeps W_up^T != 0 so the circuit receives gradients from step 0
         nn.init.orthogonal_(self.up[2].weight, gain=1.0)
 
-        # Learnable residual scale starting near identity
-        self.res_scale = nn.Parameter(torch.tensor(float(initial_scale), dtype=torch.float32))
+        # Fixed residual scale keeps initial correction near identity;
+        # the non-linear MLP `up` (102k params) adapts the magnitude smoothly without scalar gradient explosion.
+        self.res_scale = float(initial_scale)
         self.last_delta_norm = 0.0
 
     def reset_scale(self, scale: float = 0.1) -> None:
         """Reset residual scale to near-identity when entering a new incremental task."""
-        with torch.no_grad():
-            self.res_scale.fill_(float(scale))
+        self.res_scale = float(scale)
 
     def encode_angles(
         self,
