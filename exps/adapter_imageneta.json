@@ -30,7 +30,7 @@
     "rs_margin": 0.5,
     "lambda_rs": 1.0,
     "beta": 3.0,
-    "gamma": 6.0,
+    "gamma": 1.5,
     "ae_code_dims": 128,
     "ae_init_lr": 0.001,
     "ae_weight_decay": 2.424346330636298e-05
