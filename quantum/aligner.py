@@ -9,7 +9,13 @@ from quantum.simulator import RealStatevectorCircuit
 
 
 class QHybridAligner(nn.Module):
-    """Identity-initialized residual quantum-hybrid aligner."""
+    """Enhanced identity-initialized residual quantum-hybrid aligner.
+
+    Upgrades:
+    - Entanglement-aware readout (single-qubit Pauli-X/Z + 2-qubit nearest-neighbor ZZ/XX correlators).
+    - Non-linear bottleneck up-projection (hidden_dim=128) breaking the rank-16 linear subspace bottleneck.
+    - Learnable residual scale starting near identity (initial_scale=0.1) with task-to-task reset support.
+    """
 
     def __init__(
         self,
@@ -18,6 +24,9 @@ class QHybridAligner(nn.Module):
         layers: int = 2,
         centering: bool = True,
         cycle: bool = False,
+        hidden_dim: int = 128,
+        entangled_readout: bool = True,
+        initial_scale: float = 0.1,
     ) -> None:
         super().__init__()
         self.input_dim = int(input_dim)
@@ -25,7 +34,8 @@ class QHybridAligner(nn.Module):
         self.layers = int(layers)
         self.centering = bool(centering)
         self.cycle = bool(cycle)
-        self.res_scale = 0.1
+        self.hidden_dim = int(hidden_dim)
+        self.entangled_readout = bool(entangled_readout)
 
         self.encoder = build_angle_encoder(self.input_dim, self.n_qubits, self.layers)
         self.theta = nn.Parameter(torch.zeros(self.layers, self.n_qubits))
@@ -34,11 +44,26 @@ class QHybridAligner(nn.Module):
             layers=self.layers,
             cycle=self.cycle,
         )
-        self.up = nn.Linear(2 * self.n_qubits, self.input_dim, bias=False)
-        # Orthogonal init keeps W_up^T != 0 so the circuit receives gradient from step 0;
-        # the small fixed residual scale keeps the initial correction near identity (||delta|| <= 0.1 * ||obs||).
-        nn.init.orthogonal_(self.up.weight, gain=1.0)
+
+        obs_dim = 4 * self.n_qubits if self.entangled_readout else 2 * self.n_qubits
+
+        # Non-linear bottleneck up-projection expands rank from <= 16 to a rich non-linear manifold in R^768
+        self.up = nn.Sequential(
+            nn.Linear(obs_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.input_dim, bias=False),
+        )
+        # Orthogonal initialization keeps W_up^T != 0 so the circuit receives gradients from step 0
+        nn.init.orthogonal_(self.up[2].weight, gain=1.0)
+
+        # Learnable residual scale starting near identity
+        self.res_scale = nn.Parameter(torch.tensor(float(initial_scale), dtype=torch.float32))
         self.last_delta_norm = 0.0
+
+    def reset_scale(self, scale: float = 0.1) -> None:
+        """Reset residual scale to near-identity when entering a new incremental task."""
+        with torch.no_grad():
+            self.res_scale.fill_(float(scale))
 
     def encode_angles(
         self,
@@ -62,7 +87,7 @@ class QHybridAligner(nn.Module):
         features_fp32 = features.float()
         angles = self.encode_angles(features_fp32, centering_mean=centering_mean)
         states = self.circuit(angles, self.theta)
-        obs = self.circuit.readout(states)
+        obs = self.circuit.readout(states, include_correlators=self.entangled_readout)
         delta = self.up(obs) * self.res_scale
         self.last_delta_norm = float(delta.detach().norm(dim=1).mean().item())
         return features_fp32 + delta

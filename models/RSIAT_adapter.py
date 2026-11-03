@@ -142,13 +142,21 @@ class Learner(BaseLearner):
                 self.old_ae = AutoencoderSigmoid(input_dims=768, code_dims=self.args["ae_code_dims"])
             self.old_ae.to(self._device)
         elif self.aligner_type == "qhybrid":
-            self.qhybrid = QHybridAligner(
-                input_dim=768,
-                n_qubits=self.n_qubits,
-                layers=self.quantum_layers,
-                centering=self.quantum_centering,
-                cycle=self.cycle,
-            ).to(self._device)
+            warm_start = self.args.get("qhybrid_warm_start", False)
+            if self.qhybrid is None or not warm_start:
+                self.qhybrid = QHybridAligner(
+                    input_dim=768,
+                    n_qubits=self.n_qubits,
+                    layers=self.quantum_layers,
+                    centering=self.quantum_centering,
+                    cycle=self.cycle,
+                    hidden_dim=int(self.args.get("qhybrid_hidden_dim", 128)),
+                    entangled_readout=bool(self.args.get("qhybrid_entangled_readout", True)),
+                    initial_scale=float(self.args.get("qhybrid_initial_scale", 0.1)),
+                ).to(self._device)
+            else:
+                self.qhybrid.reset_scale(float(self.args.get("qhybrid_initial_scale", 0.1)))
+                self.qhybrid.to(self._device)
 
         if self.lambda_qrel > 0.0:
             if self.relational_kernel is None:
@@ -290,8 +298,9 @@ class Learner(BaseLearner):
                 param_groups.append(
                     {'params': self.old_ae.parameters(), 'lr': aux_lr, 'weight_decay': aux_wd})
             elif self.aligner_type == "qhybrid":
+                qhybrid_lr = float(self.args.get("qhybrid_lr", self.init_lr))
                 param_groups.append(
-                    {'params': self.qhybrid.parameters(), 'lr': self.init_lr, 'weight_decay': aux_wd})
+                    {'params': self.qhybrid.parameters(), 'lr': qhybrid_lr, 'weight_decay': aux_wd})
 
             if self.args['optimizer'] == 'sgd':
                 optimizer = optim.SGD(param_groups, momentum=0.9)

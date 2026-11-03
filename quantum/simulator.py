@@ -26,6 +26,9 @@ class RealStatevectorCircuit(nn.Module):
         one_indices = []
         x_pair_indices = []
         z_signs = []
+        inv_perm_indices = []
+        zz_signs = []
+        xx_pair_indices = []
 
         for j in range(self.n_qubits):
             bit = 1 << j
@@ -37,10 +40,24 @@ class RealStatevectorCircuit(nn.Module):
             x_pair_indices.append(basis ^ bit)
             z_signs.append(1.0 - 2.0 * ((basis & bit) != 0).float())
 
+            # Fast gate permutation: maps [s0, s1] concatenation back to original basis indices
+            perm = torch.cat([z_idx, o_idx])
+            inv_perm_indices.append(torch.argsort(perm))
+
+            # Two-qubit nearest-neighbor correlators (entanglement signature)
+            k = (j + 1) % self.n_qubits
+            bit_j = (basis >> j) & 1
+            bit_k = (basis >> k) & 1
+            zz_signs.append(1.0 - 2.0 * (bit_j ^ bit_k).float())
+            xx_pair_indices.append(basis ^ (1 << j) ^ (1 << k))
+
         self.register_buffer("zero_idx", torch.stack(zero_indices, dim=0), persistent=False)
         self.register_buffer("one_idx", torch.stack(one_indices, dim=0), persistent=False)
         self.register_buffer("x_pair_idx", torch.stack(x_pair_indices, dim=0), persistent=False)
         self.register_buffer("z_sign", torch.stack(z_signs, dim=0), persistent=False)
+        self.register_buffer("inv_perm_idx", torch.stack(inv_perm_indices, dim=0), persistent=False)
+        self.register_buffer("zz_sign", torch.stack(zz_signs, dim=0), persistent=False)
+        self.register_buffer("xx_pair_idx", torch.stack(xx_pair_indices, dim=0), persistent=False)
 
         cnot_perm = basis.clone()
         if self.n_qubits > 1:
@@ -75,22 +92,24 @@ class RealStatevectorCircuit(nn.Module):
                 s = torch.sin(half_angle).unsqueeze(1)
                 s0 = state.index_select(1, self.zero_idx[j])
                 s1 = state.index_select(1, self.one_idx[j])
-                state = (
-                    torch.zeros_like(state)
-                    .index_copy(1, self.zero_idx[j], c * s0 - s * s1)
-                    .index_copy(1, self.one_idx[j], s * s0 + c * s1)
-                )
+                new_state = torch.cat([c * s0 - s * s1, s * s0 + c * s1], dim=1)
+                state = new_state.index_select(1, self.inv_perm_idx[j])
             state = state.index_select(1, self.cnot_perm)
 
         return state
 
-    def readout(self, state: torch.Tensor) -> torch.Tensor:
+    def readout(self, state: torch.Tensor, include_correlators: bool = False) -> torch.Tensor:
         state = state.float()
         paired = state[:, self.x_pair_idx]
         x_exp = (state.unsqueeze(1) * paired).sum(dim=-1)
         probs = state.square()
         z_exp = probs @ self.z_sign.t()
-        return torch.cat([x_exp, z_exp], dim=1)
+        if not include_correlators:
+            return torch.cat([x_exp, z_exp], dim=1)
+        zz_exp = probs @ self.zz_sign.t()
+        paired_xx = state[:, self.xx_pair_idx]
+        xx_exp = (state.unsqueeze(1) * paired_xx).sum(dim=-1)
+        return torch.cat([x_exp, z_exp, zz_exp, xx_exp], dim=1)
 
 
 def fidelity_kernel(

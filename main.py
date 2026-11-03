@@ -22,6 +22,10 @@ DEFAULT_QR_CONFIG = {
     "rs_loss_type": "supcon",
     "rs_temperature": 0.1,
     "rs_encoder_freeze": False,
+    "qhybrid_hidden_dim": 128,
+    "qhybrid_entangled_readout": True,
+    "qhybrid_initial_scale": 0.1,
+    "qhybrid_warm_start": False,
 }
 
 
@@ -94,6 +98,16 @@ def parse_arguments():
                         help='Softmax temperature tau for base-task Q-SupCon loss.')
     parser.add_argument('--rs_encoder_freeze', type=_str2bool, nargs='?', const=True, default=None,
                         help='Freeze classical angle encoder of rs_kernel to avoid representation shortcut.')
+    parser.add_argument('--qhybrid_hidden_dim', type=int, default=None,
+                        help='Hidden dimension for QHybridAligner bottleneck up-projection (default: 128).')
+    parser.add_argument('--qhybrid_entangled_readout', type=_str2bool, nargs='?', const=True, default=None,
+                        help='Enable/disable 2-qubit correlators (ZZ & XX) in QHybridAligner readout.')
+    parser.add_argument('--qhybrid_initial_scale', type=float, default=None,
+                        help='Initial learnable residual scale for QHybridAligner (default: 0.1).')
+    parser.add_argument('--qhybrid_warm_start', type=_str2bool, nargs='?', const=True, default=None,
+                        help='Preserve and warm-start QHybridAligner across incremental tasks.')
+    parser.add_argument('--qhybrid_lr', type=float, default=None,
+                        help='Custom learning rate for QHybridAligner (defaults to init_lr).')
     parser.add_argument('--prefix', type=str, default=None,
                         help='Optional experiment log prefix override.')
     return parser.parse_args()
@@ -123,6 +137,10 @@ def validate_config(config):
     config["rs_loss_type"] = str(config.get("rs_loss_type", "supcon")).lower()
     config["rs_temperature"] = float(config.get("rs_temperature", 0.1))
     config["rs_encoder_freeze"] = bool(config.get("rs_encoder_freeze", False))
+    config["qhybrid_hidden_dim"] = int(config.get("qhybrid_hidden_dim", 128))
+    config["qhybrid_entangled_readout"] = bool(config.get("qhybrid_entangled_readout", True))
+    config["qhybrid_initial_scale"] = float(config.get("qhybrid_initial_scale", 0.1))
+    config["qhybrid_warm_start"] = bool(config.get("qhybrid_warm_start", False))
 
     if config["aligner"] not in {"rae", "qhybrid"}:
         raise ValueError(f"Unsupported aligner: {config['aligner']}")
