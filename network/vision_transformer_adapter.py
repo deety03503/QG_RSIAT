@@ -5,13 +5,19 @@
 import math
 import torch
 import torch.nn as nn
-from timm.models.layers import DropPath
+try:
+    from timm.models.layers import DropPath
+except (ImportError, ModuleNotFoundError):
+    from timm.layers import DropPath
 import timm
 from functools import partial
 from collections import OrderedDict
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import PatchEmbed
+try:
+    from timm.models.vision_transformer import PatchEmbed
+except (ImportError, ModuleNotFoundError):
+    from timm.layers import PatchEmbed
 from timm.models import register_model
 
 
