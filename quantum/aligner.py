@@ -5,12 +5,12 @@ from quantum.simulator import QuantumStateSimulator
 
 class QuantumHybridAligner(nn.Module):
     """
-    Quantum-Hybrid Residual Feature Aligner (Module 2A of QG-RSIAT):
-        A(z) = z + alpha * g(<O>_{psi(z)}, z)
-    Replaces the classical AutoencoderSigmoid with an unconstrained residual MLP
-    conditioned on local quantum observable expectations <O>_{psi(z)}, resolving
-    the positivity bias of Sigmoid while preserving the identity mapping prior at
-    the start of each incremental task.
+    Symmetric Quantum-Gated Residual Feature Aligner (Module 2 of MS-QG-RSIAT):
+        h_fused = h_c(z) * (1 + alpha_q * g_q(<O>_{psi(z)})) + beta_q * g_q(<O>_{psi(z)})
+        A(z) = z + tanh(Decoder(h_fused))
+    Replaces AutoencoderSigmoid with a symmetric Tanh-bounded residual projector
+    modulated by multi-subspace local quantum observables <O>_{psi(z)}, resolving
+    both the positivity bias of Sigmoid and vanishing gradients under small ae_init_lr.
     """
 
     def __init__(
@@ -24,14 +24,7 @@ class QuantumHybridAligner(nn.Module):
         self.input_dims = input_dims
         self.code_dims = code_dims
         self._quantum_sim_ref = (quantum_sim,)
-        obs_dim = quantum_sim.obs_dim if quantum_sim is not None else 32
-
-        self.quantum_encoder = nn.Sequential(
-            nn.Linear(obs_dim, 64),
-            nn.GELU(),
-            nn.Linear(64, code_dims),
-            nn.GELU(),
-        )
+        obs_dim = quantum_sim.obs_dim if quantum_sim is not None else 192
 
         self.classical_encoder = nn.Sequential(
             nn.Linear(input_dims, 64),
@@ -40,15 +33,22 @@ class QuantumHybridAligner(nn.Module):
             nn.GELU(),
         )
 
+        self.quantum_gate = nn.Sequential(
+            nn.Linear(obs_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, code_dims),
+            nn.Tanh(),
+        )
+
         self.decoder = nn.Sequential(
-            nn.LayerNorm(code_dims),
             nn.Linear(code_dims, 64),
             nn.GELU(),
             nn.Linear(64, input_dims),
+            nn.Tanh(),
         )
 
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
-        self.reset_parameters_for_task()
+        self.alpha_q = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.beta_q = nn.Parameter(torch.tensor(0.1))
 
     @property
     def quantum_sim(self) -> QuantumStateSimulator:
@@ -56,23 +56,23 @@ class QuantumHybridAligner(nn.Module):
 
     def reset_parameters_for_task(self):
         """
-        Initialize the final projection layer close to zero so that A(z) ≈ z
-        (Identity mapping prior) at the start of incremental adaptation.
+        Keep warm-started parameters across incremental tasks to preserve
+        accumulated drift manifold geometry under small ae_init_lr.
         """
-        last_linear = self.decoder[-1]
-        if isinstance(last_linear, nn.Linear):
-            nn.init.normal_(last_linear.weight, mean=0.0, std=1e-3)
-            if last_linear.bias is not None:
-                nn.init.zeros_(last_linear.bias)
+        return
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        q_sim = self.quantum_sim
-        if q_sim is not None:
-            obs = q_sim.observables(z)
-            h_q = self.quantum_encoder(obs)
-        else:
-            h_q = 0.0
-
+    def forward(self, z: torch.Tensor, obs: torch.Tensor = None) -> torch.Tensor:
         h_c = self.classical_encoder(z)
-        residual = self.decoder(h_c + h_q)
-        return z + self.alpha * residual
+
+        if obs is None and self.quantum_sim is not None:
+            with torch.no_grad():
+                obs = self.quantum_sim.observables(z)
+
+        if obs is not None:
+            g_q = self.quantum_gate(obs)
+            h_fused = h_c * (1.0 + self.alpha_q * g_q) + self.beta_q * g_q
+        else:
+            h_fused = h_c
+
+        residual = self.decoder(h_fused)
+        return z + residual

@@ -40,23 +40,31 @@ class Learner(BaseLearner):
         self.logit_norm = None
         self.tuned_epochs = None
 
-        num_qubits = self.args.get("num_qubits", 8)
+        num_qubits = self.args.get("num_qubits", 6)
         q_layers = self.args.get("q_layers", 2)
+        num_subspaces = self.args.get("num_subspaces", 8)
         q_tau = self.args.get("q_tau", 0.15)
+        lambda_q = self.args.get("lambda_q", 0.25)
         orth_topk = self.args.get("orth_topk", 5)
         orth_eps = self.args.get("orth_eps", 0.15)
         orth_tau = self.args.get("orth_tau", 0.1)
         rel_topk = self.args.get("rel_topk", 8)
         rel_tau = self.args.get("rel_tau", 0.15)
-        self.eta_qrel = self.args.get("eta_qrel", 1.0)
+        self.eta_qrel = self.args.get("eta_qrel", 0.2)
 
         self.quantum_sim = QuantumStateSimulator(
             input_dim=self._network.feature_dim,
             num_qubits=num_qubits,
             num_layers=q_layers,
+            num_subspaces=num_subspaces,
         ).to(self._device)
 
-        self.rs_loss_func = QSupConLoss(temperature=q_tau)
+        self.rs_loss_func = QSupConLoss(
+            alpha=self.args.get("alpha", 1.0),
+            rs_margin=self.args.get("rs_margin", 0.5),
+            temperature=q_tau,
+            lambda_q=lambda_q,
+        )
         self.q_orth_loss_func = SelectiveQuantumOrthLoss(
             topk=orth_topk,
             margin_eps=orth_eps,
@@ -107,8 +115,6 @@ class Learner(BaseLearner):
                 alpha_init=self.args.get("aligner_alpha", 0.5),
             )
             self.old_ae.to(self._device)
-        elif self._cur_task > 1 and self.old_ae is not None:
-            self.old_ae.reset_parameters_for_task()
 
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         self._network.update_fc(data_manager.get_task_size(self._cur_task))
@@ -189,7 +195,7 @@ class Learner(BaseLearner):
                 },
                 {
                     'params': self.quantum_sim.parameters(),
-                    'lr': 0.01,
+                    'lr': self.init_lr * 0.1,
                     'weight_decay': self.args['weight_decay'],
                 },
             ]
@@ -284,18 +290,35 @@ class Learner(BaseLearner):
         logging.info(info)
 
     def _inc_loss(self, features, features_old):
-        aligned_old = self.old_ae(features_old)
-        loss_align = F.mse_loss(features, aligned_old)
-
         protos = torch.from_numpy(self._class_means[:self._known_classes]).float().to(
             self._device, non_blocking=True
         )
-        aligned_protos = self.old_ae(protos)
+        with torch.no_grad():
+            obs_old = self.quantum_sim.observables(features_old)
+            obs_protos = self.quantum_sim.observables(protos)
+
+        aligned_old = self.old_ae(features_old, obs=obs_old)
+        loss_align = F.mse_loss(features, aligned_old)
+
+        aligned_protos = self.old_ae(protos, obs=obs_protos)
+
+        psi_old_aligned = self.quantum_sim.encode(aligned_old)
+        psi_protos = self.quantum_sim.encode(aligned_protos)
 
         loss_orth = self.q_orth_loss_func(
-            aligned_old, features, aligned_protos, self.quantum_sim
+            aligned_old,
+            features,
+            aligned_protos,
+            self.quantum_sim,
+            psi_old_aligned=psi_old_aligned,
+            psi_protos=psi_protos,
         )
-        loss_qrel = self.q_rel_loss_func(features, features_old, self.quantum_sim)
+        loss_qrel = self.q_rel_loss_func(
+            features,
+            aligned_old.detach(),
+            self.quantum_sim,
+            psi_target=psi_old_aligned.detach(),
+        )
 
         return (
             self.args["beta"] * loss_align

@@ -33,14 +33,16 @@
     "ae_init_lr": 5.0175731532879885e-05,
     "ae_weight_decay": 0.043872546114818035,
 
-    "num_qubits": 8,
+    "num_subspaces": 8,
+    "num_qubits": 6,
     "q_layers": 2,
     "q_tau": 0.15,
+    "lambda_q": 0.25,
     "aligner_alpha": 0.5,
     "orth_topk": 5,
     "orth_eps": 0.15,
     "orth_tau": 0.1,
     "rel_topk": 8,
     "rel_tau": 0.15,
-    "eta_qrel": 1.0
+    "eta_qrel": 0.2
 }
