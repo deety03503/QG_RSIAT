@@ -38,7 +38,7 @@
     "num_qubits": 6,
     "q_layers": 2,
     "q_tau": 0.15,
-    "lambda_q": 0.25,
+    "lambda_q": 0.1,
     "aligner_alpha": 0.5,
     "orth_topk": 5,
     "orth_eps": 0.15,
