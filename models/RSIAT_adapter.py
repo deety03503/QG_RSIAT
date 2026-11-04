@@ -257,11 +257,14 @@ class Learner(BaseLearner):
                 self.old_ae.train()
             losses = 0.0
             losses_c, losses_rt = 0.0, 0.0
+            loss_components_acc = {}
             correct, total = 0, 0
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
-                logits, loss_c, loss_rt = self._compute_rt_loss(inputs, targets, epoch, warmup_epoch)
+                logits, loss_c, loss_rt, comp_dict = self._compute_rt_loss(
+                    inputs, targets, epoch, warmup_epoch
+                )
                 loss = loss_c + loss_rt
                 optimizer.zero_grad()
                 loss.backward()
@@ -269,22 +272,49 @@ class Learner(BaseLearner):
                 losses += loss.item()
                 losses_c += loss_c.item()
                 losses_rt += loss_rt.item()
+                for k, v in comp_dict.items():
+                    loss_components_acc[k] = loss_components_acc.get(k, 0.0) + (
+                        v.item() if torch.is_tensor(v) else v
+                    )
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
             scheduler.step()
 
+            num_batches = len(train_loader)
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             test_acc = self._compute_accuracy(self._network, test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, Losses_rt {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-                self._cur_task,
-                epoch + 1,
-                self.tuned_epochs,
-                losses / len(train_loader),
-                losses_c / len(train_loader),
-                losses_rt / len(train_loader),
-                train_acc,
-                test_acc,
+
+            avg_loss = losses / num_batches
+            avg_loss_c = losses_c / num_batches
+            avg_loss_rt = losses_rt / num_batches
+            avg_comps = {k: v / num_batches for k, v in loss_components_acc.items()}
+
+            if self._cur_task == 0:
+                comp_str = "Loss_rs {:.3f}, Loss_qcon {:.3f}".format(
+                    avg_comps.get("loss_rs", 0.0),
+                    avg_comps.get("loss_qcon", 0.0),
+                )
+            else:
+                comp_str = "Loss_align {:.3f}, Loss_orth {:.3f}, Loss_qrel {:.3f}".format(
+                    avg_comps.get("loss_align", 0.0),
+                    avg_comps.get("loss_orth", 0.0),
+                    avg_comps.get("loss_qrel", 0.0),
+                )
+
+            info = (
+                "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_c {:.3f}, {}, Losses_rt {:.3f}, "
+                "Train_accy {:.2f}, Test_accy {:.2f}".format(
+                    self._cur_task,
+                    epoch + 1,
+                    self.tuned_epochs,
+                    avg_loss,
+                    avg_loss_c,
+                    comp_str,
+                    avg_loss_rt,
+                    train_acc,
+                    test_acc,
+                )
             )
             prog_bar.set_description(info)
         logging.info(info)
@@ -320,11 +350,18 @@ class Learner(BaseLearner):
             psi_target=psi_old_aligned.detach(),
         )
 
-        return (
-            self.args["beta"] * loss_align
-            + self.args["gamma"] * loss_orth
-            + self.eta_qrel * loss_qrel
-        )
+        w_align = self.args["beta"] * loss_align
+        w_orth = self.args["gamma"] * loss_orth
+        w_qrel = self.eta_qrel * loss_qrel
+        loss_inc = w_align + w_orth + w_qrel
+
+        comp_dict = {
+            "loss_align": w_align,
+            "loss_orth": w_orth,
+            "loss_qrel": w_qrel,
+        }
+
+        return loss_inc, comp_dict
 
     def _compute_rt_loss(self, inputs, targets, epoch=None, warmup_epoch=10):
         loss_cos = AngularPenaltySMLoss(
@@ -336,10 +373,19 @@ class Learner(BaseLearner):
 
         if self._cur_task == 0:
             lambda_rs = self.args["lambda_rs"] * min(1.0, epoch / max(1, warmup_epoch))
-            loss_base = lambda_rs * self.rs_loss_func(features, targets, self.quantum_sim)
-            return logits, loss_c, loss_base
+            loss_base_raw, q_comp = self.rs_loss_func(
+                features, targets, self.quantum_sim, return_components=True
+            )
+            loss_base = lambda_rs * loss_base_raw
+            loss_rs = lambda_rs * q_comp["loss_rs_cos"]
+            loss_qcon = lambda_rs * self.rs_loss_func.lambda_q * q_comp["loss_qsupcon"]
+            comp_dict = {
+                "loss_rs": loss_rs,
+                "loss_qcon": loss_qcon,
+            }
+            return logits, loss_c, loss_base, comp_dict
 
         with torch.no_grad():
             features_old = self.old_network_module_ptr.extract_vector(inputs)
-        loss_inc = self._inc_loss(features, features_old)
-        return logits, loss_c, loss_inc
+        loss_inc, comp_dict = self._inc_loss(features, features_old)
+        return logits, loss_c, loss_inc, comp_dict

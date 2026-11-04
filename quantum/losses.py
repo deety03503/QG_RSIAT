@@ -31,10 +31,14 @@ class QSupConLoss(nn.Module):
         features: torch.Tensor,
         labels: torch.Tensor,
         simulator: QuantumStateSimulator,
-    ) -> torch.Tensor:
+        return_components: bool = False,
+    ):
         batch_size = features.size(0)
         if batch_size <= 1:
-            return features.sum() * 0.0
+            zero_loss = features.sum() * 0.0
+            if return_components:
+                return zero_loss, {"loss_rs_cos": zero_loss, "loss_qsupcon": zero_loss}
+            return zero_loss
 
         features_norm = F.normalize(features, p=2, dim=1, eps=1e-8)
         cos_sim = torch.matmul(features_norm, features_norm.t())
@@ -80,7 +84,13 @@ class QSupConLoss(nn.Module):
         else:
             loss_qsupcon = q_sim.sum() * 0.0
 
-        return loss_rs_cos + self.lambda_q * loss_qsupcon
+        total_loss = loss_rs_cos + self.lambda_q * loss_qsupcon
+        if return_components:
+            return total_loss, {
+                "loss_rs_cos": loss_rs_cos,
+                "loss_qsupcon": loss_qsupcon,
+            }
+        return total_loss
 
 
 class SelectiveQuantumOrthLoss(nn.Module):
@@ -114,9 +124,13 @@ class SelectiveQuantumOrthLoss(nn.Module):
         simulator: QuantumStateSimulator,
         psi_old_aligned: torch.Tensor = None,
         psi_protos: torch.Tensor = None,
-    ) -> torch.Tensor:
+        return_components: bool = False,
+    ):
         if old_protos_aligned.size(0) == 0 or z_aligned_old.size(0) == 0:
-            return z_aligned_old.sum() * 0.0
+            zero_loss = z_aligned_old.sum() * 0.0
+            if return_components:
+                return zero_loss, {"loss_global": zero_loss, "loss_selective": zero_loss}
+            return zero_loss
 
         u_norm = F.normalize(z_aligned_old, p=2, dim=1, eps=1e-8)
         p_norm = F.normalize(old_protos_aligned, p=2, dim=1, eps=1e-8)
@@ -141,7 +155,13 @@ class SelectiveQuantumOrthLoss(nn.Module):
         )
         loss_selective = (weights * sel_penalty).sum(dim=1).mean()
 
-        return (1.0 - self.rho_sel) * loss_global + self.rho_sel * loss_selective
+        total_loss = (1.0 - self.rho_sel) * loss_global + self.rho_sel * loss_selective
+        if return_components:
+            return total_loss, {
+                "loss_global": loss_global,
+                "loss_selective": loss_selective,
+            }
+        return total_loss
 
 
 class TopKQuantumRelLoss(nn.Module):
@@ -163,10 +183,14 @@ class TopKQuantumRelLoss(nn.Module):
         simulator: QuantumStateSimulator,
         psi_cur: torch.Tensor = None,
         psi_target: torch.Tensor = None,
-    ) -> torch.Tensor:
+        return_components: bool = False,
+    ):
         batch_size = z_cur.size(0)
         if batch_size <= 1:
-            return z_cur.sum() * 0.0
+            zero_loss = z_cur.sum() * 0.0
+            if return_components:
+                return zero_loss, {"amp_loss": zero_loss, "kl_loss": zero_loss}
+            return zero_loss
 
         with torch.no_grad():
             if psi_target is None:
@@ -193,5 +217,9 @@ class TopKQuantumRelLoss(nn.Module):
         )
         amp_loss = (p_target * smooth_diff).sum(dim=1).mean()
         kl_div = (p_target * (log_p_target - log_p_cur)).sum(dim=1).mean()
+        kl_loss = (self.temperature ** 2) * kl_div
 
-        return amp_loss + (self.temperature ** 2) * kl_div
+        total_loss = amp_loss + kl_loss
+        if return_components:
+            return total_loss, {"amp_loss": amp_loss, "kl_loss": kl_loss}
+        return total_loss
