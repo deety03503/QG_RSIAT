@@ -36,7 +36,7 @@
     "ae_weight_decay": 2.424346330636298e-05,
     "num_subspaces": 8,
     "num_qubits": 6,
-    "q_layers": 2,
+    "q_layers": 3,
     "q_tau": 0.15,
     "lambda_q": 0.1,
     "aligner_alpha": 0.5,
